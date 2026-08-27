@@ -1,0 +1,7 @@
+/vendor/
+/composer.lock
+/.idea/
+/.vscode/
+/.php-cs-fixer.cache
+/.pint.cache
+.DS_Store
