@@ -1,7 +1,12 @@
+# Consumers resolve library dependencies through their own Composer lock file.
 /vendor/
 /composer.lock
+
+# Keep local editor settings out of the package.
 /.idea/
 /.vscode/
+
+# Ignore generated formatter caches and operating-system metadata.
 /.php-cs-fixer.cache
 /.pint.cache
 .DS_Store
