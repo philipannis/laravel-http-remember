@@ -1,7 +1,7 @@
 # Keep text files consistent across operating systems.
 * text=auto eol=lf
 
-# Ship runtime code and documentation without contributor-only configuration.
+# Ship runtime code and documentation without development configuration.
 /.editorconfig export-ignore
 /.gitattributes export-ignore
 /.gitignore export-ignore

@@ -1,0 +1,62 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "philipannis/laravel-http-remember",
+    "description": "Add remember() to Laravel's HTTP client. Cache responses for a set time, or use stale-while-revalidate when speed matters more than the latest data.",
+    "type": "library",
+    "keywords": [
+        "laravel",
+        "http-client",
+        "api-cache",
+        "cache",
+        "caching",
+        "remember",
+        "response-cache",
+        "stale-while-revalidate"
+    ],
+    "homepage": "https://github.com/philipannis/laravel-http-remember",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Philip Annis",
+            "homepage": "https://github.com/philipannis",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "guzzlehttp/guzzle": "^7.8",
+        "guzzlehttp/promises": "^2.0.3",
+        "guzzlehttp/psr7": "^2.6",
+        "illuminate/cache": "^12.0 || ^13.0",
+        "illuminate/contracts": "^12.0 || ^13.0",
+        "illuminate/http": "^12.0 || ^13.0",
+        "illuminate/support": "^12.0 || ^13.0",
+        "psr/http-message": "^1.1 || ^2.0"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "PhilipAnnis\\HttpRemember\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "PhilipAnnis\\HttpRemember\\HttpRememberServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "format": "pint",
+        "format:check": "pint --test"
+    },
+    "scripts-descriptions": {
+        "format": "Format PHP files with Laravel Pint.",
+        "format:check": "Check PHP formatting without changing files."
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
