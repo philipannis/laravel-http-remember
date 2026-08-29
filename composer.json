@@ -34,11 +34,17 @@
         "psr/http-message": "^1.1 || ^2.0"
     },
     "require-dev": {
-        "laravel/pint": "^1.0"
+        "laravel/pint": "^1.0",
+        "orchestra/testbench": "^10.0 || ^11.0"
     },
     "autoload": {
         "psr-4": {
             "PhilipAnnis\\HttpRemember\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PhilipAnnis\\HttpRemember\\Tests\\": "tests/"
         }
     },
     "extra": {
@@ -50,11 +56,13 @@
     },
     "scripts": {
         "format": "pint",
-        "format:check": "pint --test"
+        "format:check": "pint --test",
+        "test": "phpunit"
     },
     "scripts-descriptions": {
         "format": "Format PHP files with Laravel Pint.",
-        "format:check": "Check PHP formatting without changing files."
+        "format:check": "Check PHP formatting without changing files.",
+        "test": "Run the PHPUnit test suite."
     },
     "config": {
         "sort-packages": true
