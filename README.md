@@ -11,8 +11,7 @@ Add `remember()` to Laravel's HTTP client to cache successful API responses. It 
 Requires PHP 8.2+ with Laravel 12, or PHP 8.3+ with Laravel 13.
 
 ```bash
-composer config repositories.laravel-http-remember vcs https://github.com/philipannis/laravel-http-remember
-composer require philipannis/laravel-http-remember:dev-main
+composer require philipannis/laravel-http-remember:1-alpha
 ```
 
 Then add `remember()` before sending a request:
