@@ -2,6 +2,7 @@
 
 namespace PhilipAnnis\HttpRemember\Tests\Feature;
 
+use GuzzleHttp\Cookie\CookieJar;
 use GuzzleHttp\Promise\PromiseInterface;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Http\Client\ConnectionException;
@@ -80,6 +81,93 @@ final class HttpRememberTest extends TestCase
 
         // Confirm only the initial request reached the fake API handler.
         Http::assertSentCount(1);
+    }
+
+    /**
+     * Confirm independent callers can reuse a response without sharing newly issued cookies.
+     */
+    public function test_responses_with_cookies_are_cached_without_populating_another_callers_jar(): void
+    {
+        // Return a successful body alongside newly issued session and affinity cookies.
+        Http::fake([
+            self::API_URL => Http::response(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK, [
+                'Set-Cookie' => ['session=first-session; Path=/; HttpOnly', 'affinity=first-server; Path=/'],
+                'X-Response-Version' => (string) self::INITIAL_VERSION,
+            ]),
+        ]);
+
+        // Send the same anonymous request with independent cookie jars.
+        $firstJar = new CookieJar;
+        $secondJar = new CookieJar;
+        $first = Http::withOptions(['cookies' => $firstJar])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $second = Http::withOptions(['cookies' => $secondJar])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+
+        // Deliver newly issued cookies only to the caller that reached the upstream server.
+        self::assertNotEmpty($first->header('Set-Cookie'));
+        self::assertSame('first-session', $firstJar->getCookieByName('session')?->getValue());
+        self::assertSame('first-server', $firstJar->getCookieByName('affinity')?->getValue());
+        self::assertSame('', $second->header('Set-Cookie'));
+        self::assertNull($secondJar->getCookieByName('session'));
+        self::assertNull($secondJar->getCookieByName('affinity'));
+
+        // Reuse the cached body and ordinary headers without another upstream call.
+        self::assertSame($first->json(), $second->json());
+        self::assertSame((string) self::INITIAL_VERSION, $second->header('X-Response-Version'));
+        Http::assertSentCount(1);
+    }
+
+    /**
+     * Confirm cookies already sent with a request keep existing sessions in separate entries.
+     */
+    public function test_existing_session_cookies_create_separate_cache_entries(): void
+    {
+        // Return a distinct successful response for each established upstream session.
+        $this->fakeVersionSequence();
+
+        // Repeat otherwise identical requests with two different session cookies.
+        $first = Http::withCookies(['session' => 'first-session'], 'api.example.test')->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $firstAgain = Http::withCookies(['session' => 'first-session'], 'api.example.test')->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $second = Http::withCookies(['session' => 'second-session'], 'api.example.test')->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $secondAgain = Http::withCookies(['session' => 'second-session'], 'api.example.test')->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+
+        // Confirm each session reuses only its own response and keeps its original cookie.
+        self::assertSame(self::INITIAL_VERSION, $first->json('version'));
+        self::assertSame(self::INITIAL_VERSION, $firstAgain->json('version'));
+        self::assertSame(self::UPDATED_VERSION, $second->json('version'));
+        self::assertSame(self::UPDATED_VERSION, $secondAgain->json('version'));
+        self::assertSame('first-session', $firstAgain->cookies()->getCookieByName('session')?->getValue());
+        self::assertSame('second-session', $secondAgain->cookies()->getCookieByName('session')?->getValue());
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm deferred refreshes keep caching responses that issue new session cookies.
+     */
+    public function test_refreshed_responses_do_not_replay_new_session_cookies(): void
+    {
+        // Freeze time and issue a different cookie with the initial and refreshed responses.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        Http::fakeSequence()
+            ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=initial-session; Path=/'])
+            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=refreshed-session; Path=/']);
+
+        // Populate the cache before returning its stale response without issuing cookies.
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        $stale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame('', $stale->header('Set-Cookie'));
+
+        // Refresh the cached body and return it to a caller with a separate cookie jar.
+        app(DeferredCallbackCollection::class)->invoke();
+        $jar = new CookieJar;
+        $refreshed = Http::withOptions(['cookies' => $jar])->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Confirm the refreshed body was cached without adopting the refresh's session.
+        self::assertSame(self::UPDATED_VERSION, $refreshed->json('version'));
+        self::assertSame('', $refreshed->header('Set-Cookie'));
+        self::assertNull($jar->getCookieByName('session'));
+        Http::assertSentCount(2);
     }
 
     /**
