@@ -15,7 +15,7 @@ use RuntimeException;
  *
  * @internal
  *
- * @phpstan-type Payload array{id: string, stored_at: int, status: int, headers: array<string, list<string>>, body: string, protocol: string, reason: string}
+ * @phpstan-type Payload array{id: string, stored_at: int|float, status: int, headers: array<string, list<string>>, body: string, protocol: string, reason: string}
  */
 final class HttpRememberResponse
 {
@@ -51,16 +51,18 @@ final class HttpRememberResponse
 
         // Restore the cursor even when reading the response body fails.
         try {
+            // Read the complete response body for serialization.
             $stream->rewind();
             $body = $stream->getContents();
         } finally {
+            // Leave the live response at the caller's original stream position.
             $stream->seek($position);
         }
 
-        // Record the lifetime from completion of the successful response.
+        // Record completion with fractional seconds so rounding cannot shorten the lifetime.
         return new self([
             'id' => Str::random(),
-            'stored_at' => Carbon::now()->getTimestamp(),
+            'stored_at' => Carbon::now()->getPreciseTimestamp() / 1000000,
             'status' => $status,
             'headers' => $response->getHeaders(),
             'body' => $body,
@@ -83,7 +85,8 @@ final class HttpRememberResponse
         }
 
         // Check scalar types and restrict stored statuses to successful responses.
-        if (! is_string($data['id']) || ! is_int($data['stored_at']) || ! is_int($data['status'])
+        if (! is_string($data['id']) || (! is_int($data['stored_at']) && ! is_float($data['stored_at']))
+            || ! is_finite($data['stored_at']) || ! is_int($data['status'])
             || $data['status'] < HttpStatus::HTTP_OK || $data['status'] >= HttpStatus::HTTP_MULTIPLE_CHOICES || ! is_array($data['headers'])
             || ! is_string($data['body']) || ! is_string($data['protocol']) || ! is_string($data['reason'])) {
             return null;
@@ -91,6 +94,7 @@ final class HttpRememberResponse
 
         // Require header names and lists of values to contain only strings.
         foreach ($data['headers'] as $name => $values) {
+            // Reject malformed header entries before reconstructing a PSR-7 response.
             if (! is_string($name) || ! is_array($values) || ! array_is_list($values)
                 || array_filter($values, 'is_string') !== $values) {
                 return null;
@@ -110,7 +114,7 @@ final class HttpRememberResponse
     public function hasReached(int $seconds): bool
     {
         // Compare ages without extending the entry's lifetime on cache hits.
-        return Carbon::now()->getTimestamp() - $this->data['stored_at'] >= $seconds;
+        return Carbon::now()->getPreciseTimestamp() / 1000000 >= $this->data['stored_at'] + $seconds;
     }
 
     /**
