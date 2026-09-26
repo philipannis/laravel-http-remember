@@ -163,6 +163,8 @@ Header names and their ordering are normalized. Header values, body bytes, and q
 
 The cache stores arrays and scalars for the response's status, headers, body, protocol, reason phrase, and creation metadata. Each cache hit creates a normal `Illuminate\Http\Client\Response` with its own body stream. You can keep using `json()`, `body()`, `header()`, `successful()`, and `throw()`.
 
+Responses containing `Set-Cookie` are still cached. Live responses deliver those cookies to their caller, while cached copies retain the body and other headers and omit `Set-Cookie`. Cookies already sent with a request remain part of its cache key, so different established sessions use separate entries. Use ordinary live requests for session creation or authentication flows that need fresh cookies or issue session credentials in the response body.
+
 Async requests and pools keep their usual promise behavior. Add `remember()` to each request inside a pool.
 
 ## Refreshes and failures
