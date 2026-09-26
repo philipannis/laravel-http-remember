@@ -180,7 +180,7 @@ Keep `InvokeDeferredCallbacks` and the normal termination hooks enabled. Long-ru
 
 Refreshes make one attempt through the remaining Guzzle handler stack. `retry()` still applies to foreground requests; deferred refreshes don't repeat that outer retry loop. Failed refreshes never extend the stale period.
 
-When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently. Cache misses aren't locked, so concurrent misses can make separate API calls, as with `Cache::remember()`.
+When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently. Network requests on cache misses aren't locked, so concurrent misses can make separate API calls, as with `Cache::remember()`. A short, nonblocking lock protects cache writes on stores that support locks. A response that completes later keeps its caller's result without replacing a response another caller has already cached.
 
 Warnings include the hashed cache key when available, plus an HTTP status or exception class where relevant. They leave out URLs, credentials, response bodies, and exception messages.
 
