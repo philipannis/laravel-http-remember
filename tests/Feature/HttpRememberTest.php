@@ -4,6 +4,9 @@ namespace PhilipAnnis\HttpRemember\Tests\Feature;
 
 use GuzzleHttp\Cookie\CookieJar;
 use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Psr7\FnStream;
+use GuzzleHttp\Psr7\Response;
+use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
@@ -13,6 +16,7 @@ use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Mockery;
+use PhilipAnnis\HttpRemember\HttpRememberResponse;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
 use RuntimeException;
 
@@ -219,14 +223,14 @@ final class HttpRememberTest extends TestCase
         // Move to the stale boundary and make duplicate stale requests.
         Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
         $firstStale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
-        $secondStale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $secondStale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS], store: 'array')->get(self::API_URL);
 
         // Confirm stale data was served without another immediate API call.
         self::assertSame(self::INITIAL_VERSION, $firstStale->json('version'));
         self::assertSame(self::INITIAL_VERSION, $secondStale->json('version'));
         Http::assertSentCount(1);
 
-        // Confirm duplicate stale calls share one named deferred callback.
+        // Confirm implicit and explicit names for one store share a deferred callback.
         $callbacks = app(DeferredCallbackCollection::class);
         self::assertCount(1, $callbacks);
 
@@ -237,6 +241,46 @@ final class HttpRememberTest extends TestCase
         // Confirm exactly one refresh replaced the stale generation.
         self::assertSame(self::UPDATED_VERSION, $refreshed->json('version'));
         Http::assertSentCount(2);
+        self::assertCount(0, $callbacks);
+    }
+
+    /**
+     * Confirm changing the default store does not discard another store's refresh.
+     */
+    public function test_deferred_refreshes_keep_separate_default_stores(): void
+    {
+        // Prepare two independent stores that use the same empty key prefix.
+        config(['cache.stores.secondary' => ['driver' => 'array']]);
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        Http::fakeSequence()
+            ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
+            ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
+            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK)
+            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK);
+
+        // Populate the same request through each application's current default store.
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        Cache::setDefaultDriver('secondary');
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Schedule both refreshes after changing the default store between stale calls.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        Cache::setDefaultDriver('array');
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        Cache::setDefaultDriver('secondary');
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $callbacks = app(DeferredCallbackCollection::class);
+        self::assertCount(2, $callbacks);
+        $callbacks->invoke();
+
+        // Confirm each deferred callback refreshed its originally selected store.
+        $secondary = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        Cache::setDefaultDriver('array');
+        $primary = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION, $secondary->json('version'));
+        self::assertSame(self::UPDATED_VERSION, $primary->json('version'));
+        Http::assertSentCount(4);
         self::assertCount(0, $callbacks);
     }
 
@@ -481,6 +525,57 @@ final class HttpRememberTest extends TestCase
     }
 
     /**
+     * Confirm a refresh rechecks its generation after buffering a slow response body.
+     */
+    public function test_refresh_does_not_overwrite_a_generation_replaced_during_capture(): void
+    {
+        // Freeze time and populate the initial cached generation.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $cache = Cache::store();
+        $body = Utils::streamFor(json_encode(['version' => self::INITIAL_VERSION]));
+
+        // Replace the stale entry while the deferred response body is being read.
+        $refreshBody = FnStream::decorate($body, [
+            'getContents' =>
+                /**
+                 * Simulate another worker storing a newer response during buffering.
+                 *
+                 * @return string The older deferred response body.
+                 */
+                static function () use ($cache, $body): string {
+                    // Write a new generation under the original request's cache key.
+                    $key = array_key_first($cache->getStore()->all());
+                    $replacement = HttpRememberResponse::capture(new Response(
+                        HttpStatus::HTTP_OK,
+                        [],
+                        json_encode(['version' => self::UPDATED_VERSION]),
+                    ));
+                    $cache->put($key, $replacement->toArray(), self::LIFETIME_SECONDS);
+
+                    // Let capture finish with the older refresh payload.
+                    return $body->getContents();
+                },
+        ]);
+
+        // Populate the cache before returning the response with controlled buffering.
+        Http::fakeSequence()
+            ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
+            ->push($refreshBody, HttpStatus::HTTP_OK);
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Schedule and execute the deferred refresh after the response becomes stale.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        app(DeferredCallbackCollection::class)->invoke();
+
+        // Confirm buffering did not let the older refresh overwrite the replacement.
+        $remembered = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION, $remembered->json('version'));
+        Http::assertSentCount(2);
+    }
+
+    /**
      * Confirm deferred refreshes cap long and unlimited network timeouts.
      */
     public function test_deferred_refresh_applies_the_configured_timeout_cap(): void
@@ -563,9 +658,13 @@ final class HttpRememberTest extends TestCase
      */
     public function test_cache_write_failure_does_not_break_the_http_request(): void
     {
+        // Retain the real in-memory lock provider before replacing the cache facade.
+        $store = Cache::store()->getStore();
+
         // Create a repository that permits the read and rejects persistence.
         $cache = Mockery::mock(Repository::class);
-        $cache->shouldReceive('get')->once()->andReturnNull();
+        $cache->shouldReceive('get')->twice()->andReturnNull();
+        $cache->shouldReceive('getStore')->once()->andReturn($store);
         $cache->shouldReceive('put')->once()->andThrow(new RuntimeException('Test cache write failure.'));
 
         // Return the controlled repository for this remembered request.
