@@ -59,12 +59,15 @@ final class HttpRememberResponse
             $stream->seek($position);
         }
 
-        // Record completion with fractional seconds so rounding cannot shorten the lifetime.
+        // Keep the response cacheable without issuing its cookies to another caller.
+        $headers = $response->withoutHeader('Set-Cookie')->getHeaders();
+
+        // Record the lifetime from completion of the successful response.
         return new self([
             'id' => Str::random(),
             'stored_at' => Carbon::now()->getPreciseTimestamp() / 1000000,
             'status' => $status,
-            'headers' => $response->getHeaders(),
+            'headers' => $headers,
             'body' => $body,
             'protocol' => $response->getProtocolVersion(),
             'reason' => $response->getReasonPhrase(),
@@ -94,7 +97,7 @@ final class HttpRememberResponse
 
         // Require header names and lists of values to contain only strings.
         foreach ($data['headers'] as $name => $values) {
-            // Reject malformed header entries before reconstructing a PSR-7 response.
+            // Reject malformed headers before reconstructing the cached response.
             if (! is_string($name) || ! is_array($values) || ! array_is_list($values)
                 || array_filter($values, 'is_string') !== $values) {
                 return null;

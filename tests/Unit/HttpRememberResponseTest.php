@@ -93,6 +93,51 @@ final class HttpRememberResponseTest extends TestCase
     }
 
     /**
+     * Confirm responses with cookies are cached without replaying their cookie headers.
+     *
+     * @param  string  $header  The case variation of the response cookie header.
+     */
+    #[DataProvider('cookieHeaderNames')]
+    public function test_response_cookies_are_preserved_only_on_the_live_response(string $header): void
+    {
+        // Prepare a successful response that sets session and affinity cookies.
+        $cookies = ['session=first-session; Path=/; HttpOnly', 'affinity=first-server; Path=/'];
+        $response = new Response(HttpStatus::HTTP_OK, [
+            $header => $cookies,
+            'X-Request-Id' => ['request-id'],
+        ], 'response-body');
+
+        // Capture and restore the successful response through its stored payload.
+        $captured = HttpRememberResponse::capture($response);
+        self::assertNotNull($captured);
+        $restored = HttpRememberResponse::restore($captured->toArray());
+        self::assertNotNull($restored);
+        $remembered = $restored->toResponse();
+
+        // Keep cookies on the live response while omitting them from the cached copy.
+        self::assertSame($cookies, $response->getHeader('Set-Cookie'));
+        self::assertFalse($remembered->hasHeader('Set-Cookie'));
+        self::assertArrayNotHasKey($header, $captured->toArray()['headers']);
+
+        // Preserve the remaining response headers and body for cached callers.
+        self::assertSame('request-id', $remembered->getHeaderLine('X-Request-Id'));
+        self::assertSame('response-body', (string) $remembered->getBody());
+    }
+
+    /**
+     * Provide cookie header names with case variations used by HTTP responses.
+     *
+     * @return iterable<string, array{string}> Cookie header names keyed by casing.
+     */
+    public static function cookieHeaderNames(): iterable
+    {
+        // Require cookie filtering to follow HTTP's case-insensitive header names.
+        yield 'standard case' => ['Set-Cookie'];
+        yield 'lowercase' => ['set-cookie'];
+        yield 'mixed case' => ['sEt-CoOkIe'];
+    }
+
+    /**
      * Confirm unsuccessful and non-seekable responses are not captured.
      */
     public function test_unsuitable_responses_are_not_captured(): void
