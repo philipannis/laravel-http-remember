@@ -38,6 +38,11 @@ final class HttpRememberMiddleware
     private const REFRESH_LOCK_BUFFER_SECONDS = 10;
 
     /**
+     * Seconds reserved for the generation check and cache write.
+     */
+    private const WRITE_LOCK_SECONDS = 10;
+
+    /**
      * Create middleware for one immutable request policy.
      *
      * @param  HttpRememberOptions  $settings  The cache lifetimes, store, and refresh limit.
@@ -79,6 +84,7 @@ final class HttpRememberMiddleware
 
                 // Treat cache failures as misses without intercepting network exceptions.
                 try {
+                    // Fingerprint the prepared request and read its remembered response.
                     $key = $this->cacheKey($request, $options);
                     $cache = Cache::store($this->settings->store);
                     $cached = HttpRememberResponse::restore($cache->get($key));
@@ -97,13 +103,17 @@ final class HttpRememberMiddleware
 
                 // Keep application event failures outside cache failure handling.
                 if ($response !== null) {
+                    // Restore Laravel's request metadata and events for the cached response.
                     ($this->onHit)($request, $options);
 
                     // Keep a usable stale response even if refresh scheduling fails.
                     if ($cached->hasReached($this->settings->fresh)) {
+                        // Contain scheduling failures while preserving the cache hit.
                         try {
+                            // Defer a refresh of the generation served to this caller.
                             $this->refreshLater($handler, $request, $options, $cache, $key, $cached->id());
                         } catch (Throwable $exception) {
+                            // Report the scheduling failure using safe exception metadata.
                             $this->logFailure('refresh', $key, ['exception' => $exception::class]);
                         }
                     }
@@ -166,8 +176,10 @@ final class HttpRememberMiddleware
 
         // Restore the request stream even when hashing an unusual stream fails.
         try {
+            // Hash the complete upload body as part of the request's identity.
             $bodyHash = Utils::hash($request->getBody(), 'sha256');
         } finally {
+            // Leave the upload ready for the original HTTP handler.
             $request->getBody()->rewind();
         }
 
@@ -197,7 +209,7 @@ final class HttpRememberMiddleware
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  Repository  $cache  The selected Laravel cache repository.
      * @param  string  $key  The generated response cache key.
-     * @param  string|null  $generation  A generation to preserve during a deferred refresh.
+     * @param  string|null  $generation  The generation to replace, or null for a cache miss.
      * @return PromiseInterface The original response with cache persistence attached.
      */
     private function sendAndRemember(
@@ -219,17 +231,50 @@ final class HttpRememberMiddleware
             function (ResponseInterface $response) use ($cache, $key, $generation): ResponseInterface {
                 // Keep response capture and cache persistence optional for the caller.
                 try {
-                    // Skip stale writes when the observed entry was replaced or invalidated.
-                    if ($generation !== null && HttpRememberResponse::restore($cache->get($key))?->id() !== $generation) {
+                    // Buffer first so a slow stream cannot invalidate the generation check.
+                    $cached = HttpRememberResponse::capture($response);
+
+                    // Persist only serializable successful responses.
+                    if ($cached === null) {
                         return $response;
                     }
 
-                    // Persist only serializable successful responses for the full lifetime.
-                    $cached = HttpRememberResponse::capture($response);
+                    // Coordinate foreground and deferred writes without locking network work.
+                    $remember =
+                        /**
+                         * Replace only the generation this request was allowed to populate.
+                         *
+                         * @return void
+                         */
+                        function () use ($cache, $key, $generation, $cached): void {
+                            // Recheck after buffering and acquiring any available write lock.
+                            $current = HttpRememberResponse::restore($cache->get($key));
 
-                    // Report stores that reject a write without throwing an exception.
-                    if ($cached !== null && ! $cache->put($key, $cached->toArray(), $this->settings->lifetime)) {
-                        $this->logFailure('write', $key);
+                            // Treat hard-expired entries as misses even before backend eviction.
+                            if ($generation === null && $current?->hasReached($this->settings->lifetime)) {
+                                $current = null;
+                            }
+
+                            // Preserve responses another caller stored while this request was pending.
+                            if ($current?->id() !== $generation) {
+                                return;
+                            }
+
+                            // Report stores that reject a write without throwing an exception.
+                            if (! $cache->put($key, $cached->toArray(), $this->settings->lifetime)) {
+                                $this->logFailure('write', $key);
+                            }
+                        };
+
+                    // Check whether the selected store can coordinate concurrent writes.
+                    $store = $cache->getStore();
+
+                    // Keep the generation check and persistence together without waiting for a lock.
+                    if ($store instanceof LockProvider) {
+                        $store->lock($key.':write', self::WRITE_LOCK_SECONDS)->get($remember);
+                    } else {
+                        // Preserve caching on stores that cannot coordinate separate workers.
+                        $remember();
                     }
                 } catch (Throwable $exception) {
                     // Preserve the response when capturing or storing it fails.
@@ -265,8 +310,10 @@ final class HttpRememberMiddleware
 
         // Copy the body without changing the caller's request stream position.
         try {
+            // Give the deferred request its own replayable upload stream.
             $request = $request->withBody(Utils::streamFor($body->getContents()));
         } finally {
+            // Restore the caller's upload after preparing the deferred copy.
             $body->rewind();
         }
 
@@ -280,10 +327,9 @@ final class HttpRememberMiddleware
         // A foreground transfer delay should not delay the deferred refresh too.
         unset($options['delay']);
 
-        // Include the selected store and its namespace in deferred deduplication.
+        // Deduplicate the resolved store even when its default name changes or is explicit.
         $name = 'http-remember:refresh:'.hash('sha256', serialize([
-            $this->settings->store,
-            $cache->getStore()->getPrefix(),
+            spl_object_id($cache->getStore()),
             $key,
         ]));
 
@@ -327,6 +373,7 @@ final class HttpRememberMiddleware
                         $lockSeconds = (int) ceil($options['timeout']) + self::REFRESH_LOCK_BUFFER_SECONDS;
                         $store->lock($key.':refresh', $lockSeconds)->get($refresh);
                     } else {
+                        // Run the deferred refresh when the store has no lock support.
                         $refresh();
                     }
                 } catch (Throwable $exception) {

@@ -131,6 +131,47 @@ final class HttpRememberResponseTest extends TestCase
     }
 
     /**
+     * Confirm fractional capture times do not shorten the configured lifetime.
+     */
+    public function test_age_threshold_preserves_fractional_seconds(): void
+    {
+        // Capture near the end of a second to expose premature timestamp rounding.
+        $storedAt = Carbon::parse(self::STORED_AT)->addMicroseconds(900000);
+        Carbon::setTestNow($storedAt);
+        $captured = HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK));
+        self::assertNotNull($captured);
+        $restored = HttpRememberResponse::restore($captured->toArray());
+        self::assertNotNull($restored);
+
+        // Remain inside the lifetime after crossing its rounded whole-second boundary.
+        Carbon::setTestNow($storedAt->copy()->addSeconds(self::AGE_THRESHOLD_SECONDS)->subMicrosecond());
+        self::assertFalse($restored->hasReached(self::AGE_THRESHOLD_SECONDS));
+
+        // Reach the full duration measured from the actual capture instant.
+        Carbon::setTestNow($storedAt->copy()->addSeconds(self::AGE_THRESHOLD_SECONDS));
+        self::assertTrue($restored->hasReached(self::AGE_THRESHOLD_SECONDS));
+    }
+
+    /**
+     * Confirm existing cache entries with integer timestamps remain readable.
+     */
+    public function test_whole_second_timestamps_can_still_be_restored(): void
+    {
+        // Build a successful payload using the original whole-second timestamp format.
+        Carbon::setTestNow(self::STORED_AT);
+        $captured = HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], 'response-body'));
+        self::assertNotNull($captured);
+        $payload = $captured->toArray();
+        $payload['stored_at'] = Carbon::now()->getTimestamp();
+
+        // Confirm the payload can be read without losing its response or age metadata.
+        $restored = HttpRememberResponse::restore($payload);
+        self::assertNotNull($restored);
+        self::assertSame('response-body', (string) $restored->toResponse()->getBody());
+        self::assertFalse($restored->hasReached(self::AGE_THRESHOLD_SECONDS));
+    }
+
+    /**
      * Confirm untrusted malformed cache values are treated as misses.
      *
      * @param  mixed  $payload  The malformed cache value under test.
@@ -165,6 +206,10 @@ final class HttpRememberResponseTest extends TestCase
         yield 'scalar' => ['response-body'];
         yield 'empty array' => [[]];
         yield 'missing identifier' => [array_diff_key($valid, ['id' => true])];
+
+        // Reject timestamps that cannot participate in finite age comparisons.
+        yield 'infinite timestamp' => [array_replace($valid, ['stored_at' => INF])];
+        yield 'not-a-number timestamp' => [array_replace($valid, ['stored_at' => NAN])];
 
         // Reject values that cannot represent a successful PSR-7 response.
         yield 'failed status' => [array_replace($valid, ['status' => HttpStatus::HTTP_SERVICE_UNAVAILABLE])];
