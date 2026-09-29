@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '8.2'
+            laravel: '12'
+            testbench: '10'
+          - php: '8.3'
+            laravel: '13'
+            testbench: '11'
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Validate Composer configuration
+        run: composer validate --strict
+
+      - name: Install dependencies for this Laravel version
+        run: >
+          composer update
+          --with "laravel/framework:^${{ matrix.laravel }}.0"
+          --with "orchestra/testbench:^${{ matrix.testbench }}.0"
+          --prefer-dist --no-interaction --no-progress
+
+      - name: Verify Laravel version
+        env:
+          EXPECTED_LARAVEL_MAJOR: ${{ matrix.laravel }}
+        run: |
+          php -r '
+            require "vendor/autoload.php";
+            $actual = \Illuminate\Foundation\Application::VERSION;
+            $expected = getenv("EXPECTED_LARAVEL_MAJOR");
+            if ((int) $actual !== (int) $expected) {
+                fwrite(STDERR, "Expected Laravel $expected, got $actual\n");
+                exit(1);
+            }
+            echo "Laravel $actual\n";
+          '
+
+      - name: Check platform requirements
+        run: composer check-platform-reqs
+
+      - name: Run tests
+        run: composer run test
+
+      - name: Check formatting
+        run: composer run format:check
