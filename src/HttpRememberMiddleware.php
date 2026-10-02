@@ -141,8 +141,9 @@ final class HttpRememberMiddleware
             return true;
         }
 
-        // Preserve streaming, file downloads, multipart uploads, and custom cURL behavior.
+        // Preserve streaming, file downloads, multipart uploads, and custom transport behavior.
         if (($options['stream'] ?? false) || isset($options['sink']) || ! empty($options['curl'])
+            || ! empty($options['stream_context'])
             || str_starts_with(strtolower($request->getHeaderLine('Content-Type')), 'multipart/')) {
             return true;
         }

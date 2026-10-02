@@ -469,6 +469,55 @@ final class HttpRememberTest extends TestCase
     }
 
     /**
+     * Confirm custom stream context options bypass response caching.
+     */
+    public function test_custom_stream_context_options_bypass_the_cache(): void
+    {
+        // Return a different response whenever the handler actually executes.
+        $this->fakeVersionSequence();
+
+        // Send distinct credentials through stream contexts without changing PSR-7 headers.
+        $first = Http::withOptions([
+            'stream_context' => ['http' => ['header' => 'Authorization: Bearer first-token']],
+        ])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $second = Http::remember(self::LIFETIME_SECONDS)->withOptions([
+            'stream_context' => ['http' => ['header' => 'Authorization: Bearer second-token']],
+        ])->get(self::API_URL);
+
+        // Confirm both requests reached the handler without storing their responses.
+        self::assertSame(self::INITIAL_VERSION, $first->json('version'));
+        self::assertSame(self::UPDATED_VERSION, $second->json('version'));
+        Http::assertSentCount(2);
+        self::assertSame([], Cache::store()->getStore()->all());
+    }
+
+    /**
+     * Confirm custom stream contexts cannot reuse or refresh an existing stale response.
+     */
+    public function test_custom_stream_context_options_bypass_existing_stale_responses(): void
+    {
+        // Freeze time and populate a response using the ordinary transport options.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $this->fakeVersionSequence();
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+
+        // Request the stale resource with credentials supplied outside its prepared headers.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        $response = Http::withOptions([
+            'stream_context' => ['http' => ['header' => 'Authorization: Bearer second-token']],
+        ])->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Confirm the live response left the existing entry and deferred callbacks unchanged.
+        self::assertSame(self::UPDATED_VERSION, $response->json('version'));
+        Http::assertSentCount(2);
+        self::assertSame($cached, $cache->all());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+    }
+
+    /**
      * Confirm later request mutation callbacks bypass response caching.
      */
     public function test_later_before_sending_callbacks_bypass_the_cache(): void
