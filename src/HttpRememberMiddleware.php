@@ -141,6 +141,11 @@ final class HttpRememberMiddleware
             return true;
         }
 
+        // Preserve Guzzle's header callbacks and their normal rejection handling.
+        if (isset($options['on_headers'])) {
+            return true;
+        }
+
         // Preserve streaming, file downloads, multipart uploads, and custom transport behavior.
         if (($options['stream'] ?? false) || isset($options['sink']) || ! empty($options['curl'])
             || ! empty($options['stream_context'])

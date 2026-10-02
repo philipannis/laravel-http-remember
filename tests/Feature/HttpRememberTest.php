@@ -3,6 +3,7 @@
 namespace PhilipAnnis\HttpRemember\Tests\Feature;
 
 use GuzzleHttp\Cookie\CookieJar;
+use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\FnStream;
 use GuzzleHttp\Psr7\Response;
@@ -18,6 +19,7 @@ use Illuminate\Support\Facades\Http;
 use Mockery;
 use PhilipAnnis\HttpRemember\HttpRememberResponse;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
+use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 
 /**
@@ -444,6 +446,87 @@ final class HttpRememberTest extends TestCase
         self::assertSame(self::INITIAL_VERSION, $samePolicy->json('version'));
         self::assertSame(self::UPDATED_VERSION, $differentPolicy->json('version'));
         Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm header callbacks run on every request without remembering their responses.
+     */
+    public function test_header_callbacks_bypass_the_cache(): void
+    {
+        // Use Guzzle's mock transport so header callbacks run without reaching the network.
+        $handler = new MockHandler([
+            new Response(HttpStatus::HTTP_OK, [], json_encode(['version' => self::INITIAL_VERSION])),
+            new Response(HttpStatus::HTTP_OK, [], json_encode(['version' => self::UPDATED_VERSION])),
+        ]);
+        $validated = 0;
+        $callback =
+            /**
+             * Validate each live response before its body is delivered.
+             *
+             * @param  ResponseInterface  $response  The response received by the transport.
+             */
+            static function (ResponseInterface $response) use (&$validated): void {
+                // Count only responses that reach Guzzle's header validation hook.
+                self::assertSame(HttpStatus::HTTP_OK, $response->getStatusCode());
+                $validated++;
+            };
+
+        // Configure the callback before and after remember to cover both fluent orders.
+        $first = Http::setHandler($handler)->preventStrayRequests(false)
+            ->withOptions(['on_headers' => $callback])
+            ->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $second = Http::setHandler($handler)->preventStrayRequests(false)
+            ->remember(self::LIFETIME_SECONDS)
+            ->withOptions(['on_headers' => $callback])->get(self::API_URL);
+
+        // Confirm both requests were validated without populating the response cache.
+        self::assertSame(self::INITIAL_VERSION, $first->json('version'));
+        self::assertSame(self::UPDATED_VERSION, $second->json('version'));
+        self::assertSame(2, $validated);
+        self::assertCount(0, $handler);
+        self::assertSame([], Cache::store()->getStore()->all());
+    }
+
+    /**
+     * Confirm header callbacks cannot reuse or refresh an existing stale response.
+     */
+    public function test_header_callbacks_bypass_existing_stale_responses(): void
+    {
+        // Freeze time and populate an ordinary response using Guzzle's mock transport.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $handler = new MockHandler([
+            new Response(HttpStatus::HTTP_OK, [], json_encode(['version' => self::INITIAL_VERSION])),
+            new Response(HttpStatus::HTTP_OK, [], json_encode(['version' => self::UPDATED_VERSION])),
+        ]);
+        Http::setHandler($handler)->preventStrayRequests(false)
+            ->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+        $validated = 0;
+
+        // Require header validation while the matching remembered response is stale.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        $response = Http::setHandler($handler)->preventStrayRequests(false)
+            ->withOptions(['on_headers' =>
+                /**
+                 * Validate the live response instead of accepting remembered headers.
+                 *
+                 * @param  ResponseInterface  $response  The response received by the transport.
+                 */
+                static function (ResponseInterface $response) use (&$validated): void {
+                    // Confirm Guzzle delivered the successful live response to the callback.
+                    self::assertSame(HttpStatus::HTTP_OK, $response->getStatusCode());
+                    $validated++;
+                },
+            ])->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Confirm validation left the existing entry and deferred callbacks unchanged.
+        self::assertSame(self::UPDATED_VERSION, $response->json('version'));
+        self::assertSame(1, $validated);
+        self::assertCount(0, $handler);
+        self::assertSame($cached, $cache->all());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
     }
 
     /**

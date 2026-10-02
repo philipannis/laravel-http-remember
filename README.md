@@ -195,6 +195,7 @@ Add custom Guzzle middleware **before** `remember()` so the cache key includes i
 | Request feature | Reason |
 | --- | --- |
 | Custom `beforeSending()` callbacks | They can change the request after its key is calculated. |
+| Guzzle `on_headers` callbacks | They must run on the live transport and can reject a response before its body is downloaded. |
 | Middleware added after `remember()` | It can change credentials, the URL, or the body after the key is calculated. |
 | Streaming or `sink()` downloads | They need to keep their streaming or file-writing behavior. |
 | Multipart uploads | Upload streams and generated boundaries aren't suitable for reuse. |

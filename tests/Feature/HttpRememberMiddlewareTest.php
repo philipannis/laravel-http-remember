@@ -2,6 +2,8 @@
 
 namespace PhilipAnnis\HttpRemember\Tests\Feature;
 
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\Promise;
 use GuzzleHttp\Promise\PromiseInterface;
@@ -17,9 +19,11 @@ use Mockery;
 use PhilipAnnis\HttpRemember\HttpRememberMiddleware;
 use PhilipAnnis\HttpRemember\HttpRememberOptions;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
+use Psr\Http\Message\ResponseInterface;
+use RuntimeException;
 
 /**
- * Verify concurrent cache writes with manually controlled network promises.
+ * Verify cache bypasses and concurrent writes with controlled network promises.
  */
 final class HttpRememberMiddlewareTest extends TestCase
 {
@@ -37,6 +41,58 @@ final class HttpRememberMiddlewareTest extends TestCase
      * The deferred network timeout used by the test policy.
      */
     private const REFRESH_TIMEOUT_SECONDS = 15;
+
+    /**
+     * Confirm a header validation failure rejects the promise even when a response is cached.
+     */
+    public function test_header_callback_rejections_bypass_existing_fresh_responses(): void
+    {
+        // Use Guzzle's mock transport to preserve its normal callback exception handling.
+        $transport = new MockHandler([
+            new Response(HttpStatus::HTTP_OK, [], 'cached-response'),
+            new Response(HttpStatus::HTTP_OK, [], 'rejected-response'),
+        ]);
+        $handler = $this->middleware()($transport);
+        $request = new Request('GET', self::API_URL);
+
+        // Populate the cache before adding a callback that rejects the next live response.
+        self::assertSame('cached-response', (string) $handler($request, [])->wait()->getBody());
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+        $failure = new RuntimeException('Test header validation failure.');
+
+        // Keep the rejected response on the ordinary Guzzle promise path.
+        $promise = $handler($request, ['on_headers' =>
+            /**
+             * Reject the live response from the transport's header hook.
+             *
+             * @param  ResponseInterface  $response  The response being validated.
+             */
+            static function (ResponseInterface $response) use ($failure): void {
+                // Ensure validation applies to the live response rather than the cached body.
+                self::assertSame('rejected-response', (string) $response->getBody());
+
+                // Let Guzzle wrap the application failure in its normal request exception.
+                throw $failure;
+            },
+        ]);
+        self::assertInstanceOf(PromiseInterface::class, $promise);
+
+        // Resolve the promise and inspect the original validation failure.
+        try {
+            $promise->wait();
+
+            // Fail explicitly if the cached response skipped header validation.
+            self::fail('The remembered request did not reject the header validation failure.');
+        } catch (RequestException $exception) {
+            // Confirm Guzzle retained the application's original exception.
+            self::assertSame($failure, $exception->getPrevious());
+        }
+
+        // Confirm the failed live request did not replace the existing remembered response.
+        self::assertCount(0, $transport);
+        self::assertSame($cached, $cache->all());
+    }
 
     /**
      * Confirm an earlier cache miss cannot overwrite another caller's cached response.
