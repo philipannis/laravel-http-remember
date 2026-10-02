@@ -10,7 +10,7 @@ use PHPUnit\Framework\TestCase;
 /**
  * Verify immutable HTTP cache policy validation.
  */
-final class HttpRememberOptionsTest extends TestCase
+final class OptionsTest extends TestCase
 {
     /**
      * The fixed lifetime accepted by the valid-policy test.
