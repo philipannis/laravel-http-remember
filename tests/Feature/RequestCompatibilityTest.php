@@ -6,6 +6,8 @@ use GuzzleHttp\Cookie\CookieJar;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Response;
+use Illuminate\Http\Client\Events\RequestSending;
+use Illuminate\Http\Client\Events\ResponseReceived;
 use Illuminate\Http\Client\Request;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Carbon;
@@ -13,6 +15,8 @@ use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 
 /**
@@ -423,6 +427,161 @@ final class RequestCompatibilityTest extends TestCase
         // Confirm both promise paths produced the initial API representation.
         self::assertSame(self::INITIAL_VERSION, $first->json('version'));
         self::assertSame(self::INITIAL_VERSION, $second->json('version'));
+        Http::assertSentCount(1);
+    }
+
+    /**
+     * Confirm cloned cache hits retain their own cookies, attributes, and HTTP events.
+     *
+     * @param  bool  $async  Whether the cloned request returns a promise.
+     */
+    #[DataProvider('clonedRequestModes')]
+    public function test_cloned_cache_hits_populate_the_sending_builders_metadata(bool $async): void
+    {
+        // Populate the cache independently of the builder that will be cloned.
+        Http::fake([self::API_URL => Http::response('remembered-body', HttpStatus::HTTP_OK)]);
+        Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+
+        // Give the cloned request its own cookie jar and caller attributes.
+        $originalJar = new CookieJar;
+        $jar = new CookieJar;
+        $original = Http::withOptions(['cookies' => $originalJar])
+            ->remember(self::LIFETIME_SECONDS)
+            ->withAttributes(['original' => true]);
+        $clone = clone $original;
+        $clone->async($async)->withOptions(['cookies' => $jar])->withAttributes(['cloned' => true]);
+
+        // Observe the public request events after the initial cache population.
+        $sending = [];
+        $received = [];
+        app('events')->listen(RequestSending::class,
+            /**
+             * Record the request that Laravel prepares for the cache hit.
+             */
+            static function (RequestSending $event) use (&$sending): void {
+                $sending[] = $event;
+            },
+        );
+        app('events')->listen(ResponseReceived::class,
+            /**
+             * Record the response event emitted by the cloned builder.
+             */
+            static function (ResponseReceived $event) use (&$received): void {
+                $received[] = $event;
+            },
+        );
+
+        // Resolve both synchronous and asynchronous cache-hit responses.
+        $response = $clone->get(self::API_URL);
+        if ($async) {
+            self::assertInstanceOf(PromiseInterface::class, $response);
+            $response = $response->wait();
+        }
+
+        // Confirm bookkeeping belongs to the clone without another handler execution.
+        self::assertSame('remembered-body', $response->body());
+        self::assertSame($jar, $response->cookies());
+        self::assertCount(1, $sending);
+        self::assertCount(1, $received);
+        self::assertSame($sending[0]->request, $received[0]->request);
+        self::assertSame($response, $received[0]->response);
+        self::assertSame(['original' => true, 'cloned' => true], $sending[0]->request->attributes());
+        Http::assertSentCount(1);
+
+        // Reuse the original to confirm the clone did not replace its callback bindings.
+        $originalResponse = $original->get(self::API_URL);
+        self::assertSame($originalJar, $originalResponse->cookies());
+        self::assertCount(2, $sending);
+        self::assertCount(2, $received);
+        self::assertSame(['original' => true], $sending[1]->request->attributes());
+        self::assertSame($sending[1]->request, $received[1]->request);
+        Http::assertSentCount(1);
+    }
+
+    /**
+     * Provide both public HTTP request execution modes for cloned builders.
+     *
+     * @return iterable<string, array{bool}> Request modes keyed by their promise behavior.
+     */
+    public static function clonedRequestModes(): iterable
+    {
+        // Exercise the immediate response and fulfilled promise paths.
+        yield 'synchronous' => [false];
+        yield 'asynchronous' => [true];
+    }
+
+    /**
+     * Confirm a cloned cache hit clears statistics inherited from a live request.
+     */
+    public function test_cloned_cache_hits_clear_inherited_transfer_statistics(): void
+    {
+        // Use an in-memory Guzzle handler that produces normal transfer statistics.
+        $handler = new MockHandler([new Response(HttpStatus::HTTP_OK, [], 'remembered-body')]);
+        $original = Http::setHandler($handler)->preventStrayRequests(false)->remember(self::LIFETIME_SECONDS);
+        $live = $original->get(self::API_URL);
+        self::assertSame(self::API_URL, (string) $live->effectiveUri());
+
+        // Clone the populated builder so its previous transfer statistics are inherited.
+        $clone = clone $original;
+        $remembered = $clone->get(self::API_URL);
+
+        // Confirm the cached response does not claim an earlier network transfer.
+        self::assertSame('remembered-body', $remembered->body());
+        self::assertNull($remembered->effectiveUri());
+        self::assertSame([], $remembered->handlerStats());
+        self::assertCount(0, $handler);
+    }
+
+    /**
+     * Confirm later middleware on a clone still prevents response caching.
+     */
+    public function test_later_middleware_on_a_clone_bypasses_the_cache(): void
+    {
+        // Return distinct bodies whenever a cloned request reaches the fake handler.
+        Http::fakeSequence()->push('first-body')->push('second-body');
+        $original = Http::remember(self::LIFETIME_SECONDS);
+        $clone = clone $original;
+
+        // Separate the middleware collections before changing only the clone's stack.
+        $original->remember(self::LIFETIME_SECONDS);
+        $clone->withRequestMiddleware(
+            /**
+             * Represent a later middleware that changes the cloned request's identity.
+             *
+             * @return RequestInterface The request carrying the clone's credentials.
+             */
+            static fn (RequestInterface $request): RequestInterface => $request->withHeader('Authorization', 'Bearer clone-token'),
+        );
+
+        // Confirm both requests preserve the later middleware's normal execution.
+        self::assertSame('first-body', $clone->get(self::API_URL)->body());
+        self::assertSame('second-body', $clone->get(self::API_URL)->body());
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm changes to the original builder do not disable caching on its clone.
+     */
+    public function test_later_middleware_on_the_original_does_not_bypass_the_clones_cache(): void
+    {
+        // Return a second body if the clone incorrectly inherits the original's guard.
+        Http::fakeSequence()->push('first-body')->push('second-body');
+        $original = Http::remember(self::LIFETIME_SECONDS);
+        $clone = clone $original;
+
+        // Replace the original's policy before adding middleware to its independent stack.
+        $original->remember(self::LIFETIME_SECONDS)->withRequestMiddleware(
+            /**
+             * Represent a later request mutation confined to the original builder.
+             *
+             * @return RequestInterface The request carrying the original's credentials.
+             */
+            static fn (RequestInterface $request): RequestInterface => $request->withHeader('Authorization', 'Bearer original-token'),
+        );
+
+        // Confirm the unmodified clone can still remember its own response.
+        self::assertSame('first-body', $clone->get(self::API_URL)->body());
+        self::assertSame('first-body', $clone->get(self::API_URL)->body());
         Http::assertSentCount(1);
     }
 
