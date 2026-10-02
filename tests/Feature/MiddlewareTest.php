@@ -25,7 +25,7 @@ use RuntimeException;
 /**
  * Verify cache bypasses and concurrent writes with controlled network promises.
  */
-final class HttpRememberMiddlewareTest extends TestCase
+final class MiddlewareTest extends TestCase
 {
     /**
      * The shared fake endpoint used by identical-request tests.

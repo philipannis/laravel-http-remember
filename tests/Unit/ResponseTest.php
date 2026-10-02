@@ -14,7 +14,7 @@ use PHPUnit\Framework\TestCase;
 /**
  * Verify the serializable representation of remembered responses.
  */
-final class HttpRememberResponseTest extends TestCase
+final class ResponseTest extends TestCase
 {
     /**
      * The instant used as the response capture time.
