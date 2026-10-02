@@ -200,6 +200,7 @@ Add custom Guzzle middleware **before** `remember()` so the cache key includes i
 | Multipart uploads | Upload streams and generated boundaries aren't suitable for reuse. |
 | Unreadable, non-seekable, or already-consumed request bodies | The body can't be hashed and restored safely. |
 | Custom cURL options, including digest and NTLM authentication | They can change behavior outside the request used for the cache key. |
+| Custom `stream_context` options | They can override headers, bodies, or transport behavior outside the request used for the cache key. |
 
 Non-seekable response bodies are also returned without being cached. Use Laravel's normal client stack; a client passed to `setClient()` controls its own middleware.
 
