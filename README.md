@@ -182,6 +182,10 @@ Keep `InvokeDeferredCallbacks` and the normal termination hooks enabled. Long-ru
 
 Refreshes make one attempt through the remaining Guzzle handler stack. `retry()` still applies to foreground requests; deferred refreshes don't repeat that outer retry loop. Failed refreshes never extend the stale period.
 
+For stale-while-revalidate policies, the cache store retains each response for `refresh_timeout` plus 10 seconds beyond its logical lifetime. This gives a refresh that starts before expiry time to finish while its original generation can still be checked. Requests always enforce the configured lifetime, so retained expired responses are never served. Fixed-lifetime policies expire in the store at their configured lifetime.
+
+A refresh replaces only the generation it started with. Removing that cache entry or flushing the store before the refresh's final generation check cancels its write, even when the original lifetime has elapsed. A missing generation is never treated as proof of natural expiry. Deferred callbacks also skip generations that expire before the refresh starts.
+
 When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently. Network requests on cache misses aren't locked, so concurrent misses can make separate API calls, as with `Cache::remember()`. A short, nonblocking lock protects cache writes on stores that support locks. A response that completes later keeps its caller's result without replacing a response another caller has already cached.
 
 Warnings include the hashed cache key when available, plus an HTTP status or exception class where relevant. They leave out URLs, credentials, response bodies, and exception messages.

@@ -282,16 +282,19 @@ final class HttpRememberMiddleware
                                 $current = null;
                             }
 
-                            // Allow a completed refresh to repopulate its naturally expired entry.
-                            $expiredDuringRefresh = $current === null && $generation?->hasReached($this->settings->lifetime);
-
-                            // Preserve other generations and missing entries that should still be unexpired.
-                            if ($current?->id() !== $generation?->id() && ! $expiredDuringRefresh) {
+                            // Preserve replacements and cancel refreshes whose generation was removed.
+                            if ($current?->id() !== $generation?->id()) {
                                 return;
                             }
 
+                            // Retain stale-policy generations through the bounded refresh window.
+                            $retention = $this->settings->lifetime;
+                            if ($this->settings->fresh < $this->settings->lifetime) {
+                                $retention += $this->settings->refreshTimeout + self::REFRESH_LOCK_BUFFER_SECONDS;
+                            }
+
                             // Report stores that reject a write without throwing an exception.
-                            if (! $cache->put($key, $cached->toArray(), $this->settings->lifetime)) {
+                            if (! $cache->put($key, $cached->toArray(), $retention)) {
                                 $this->logFailure('write', $key);
                             }
                         };
@@ -381,8 +384,9 @@ final class HttpRememberMiddleware
                          * @return void
                          */
                         function () use ($handler, $request, $options, $cache, $key, $generation): void {
-                            // Avoid repeating work after another worker replaces the entry.
-                            if (HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id()) {
+                            // Skip expired generations and entries removed or replaced before execution.
+                            if ($generation->hasReached($this->settings->lifetime)
+                                || HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id()) {
                                 return;
                             }
 

@@ -61,6 +61,11 @@ final class CacheLifecycleTest extends TestCase
     private const REFRESH_TIMEOUT_SECONDS = 15;
 
     /**
+     * Seconds retained for response buffering and persistence after the refresh timeout.
+     */
+    private const REFRESH_BUFFER_SECONDS = 10;
+
+    /**
      * Confirm the default policy stores and restores a successful response.
      */
     public function test_default_policy_remembers_a_successful_response(): void
@@ -101,6 +106,8 @@ final class CacheLifecycleTest extends TestCase
 
         // Populate the cache and remain immediately inside its fixed lifetime.
         $initial = Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $cache = Cache::store();
+        $key = array_key_first($cache->getStore()->all());
         Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS - 1));
         $remembered = Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
 
@@ -111,6 +118,7 @@ final class CacheLifecycleTest extends TestCase
 
         // Reach the exact expiry boundary and request the resource again.
         Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
+        self::assertNull($cache->get($key));
         $expired = Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
 
         // Confirm hard expiry synchronously fetched and stored the next generation.
@@ -209,7 +217,13 @@ final class CacheLifecycleTest extends TestCase
         Carbon::setTestNow($completedAt->copy()->addSeconds(self::LIFETIME_SECONDS - 1));
         self::assertNotNull($cache->get($key));
         Carbon::setTestNow($completedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
-        self::assertNull($cache->get($key));
+
+        // Retained generation data must not let callers reuse a logically expired response.
+        self::assertNotNull($cache->get($key));
+        $expired = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION + 1, $expired->json('version'));
+        Http::assertSentCount(3);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
     }
 
     /**
@@ -222,6 +236,65 @@ final class CacheLifecycleTest extends TestCase
         // Treat the exact expiry boundary as an expired entry too.
         yield 'at expiry' => [self::LIFETIME_SECONDS];
         yield 'after expiry' => [self::LIFETIME_SECONDS + 1];
+    }
+
+    /**
+     * Confirm retained stale generations are evicted after their bounded refresh window.
+     */
+    public function test_stale_generations_have_bounded_backend_retention(): void
+    {
+        // Freeze time and store a response without scheduling a deferred refresh.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        Http::fake([self::API_URL => Http::response(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)]);
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $cache = Cache::store();
+        $key = array_key_first($cache->getStore()->all());
+
+        // Keep the generation available after its response has reached logical hard expiry.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
+        $retained = HttpRememberResponse::restore($cache->get($key));
+        self::assertNotNull($retained);
+        self::assertTrue($retained->hasReached(self::LIFETIME_SECONDS));
+
+        // Retain only enough additional time for a bounded transfer and its persistence.
+        $retention = self::LIFETIME_SECONDS + self::REFRESH_TIMEOUT_SECONDS + self::REFRESH_BUFFER_SECONDS;
+        Carbon::setTestNow($startedAt->copy()->addSeconds($retention - 1));
+        self::assertNotNull($cache->get($key));
+        Carbon::setTestNow($startedAt->copy()->addSeconds($retention));
+        self::assertNull($cache->get($key));
+        Http::assertSentCount(1);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+    }
+
+    /**
+     * Confirm a delayed callback skips a retained generation that expired before execution.
+     */
+    public function test_deferred_refresh_skips_a_generation_that_expires_before_execution(): void
+    {
+        // Freeze time and populate the response that will become stale.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $this->fakeVersionSequence();
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $cache = Cache::store();
+        $key = array_key_first($cache->getStore()->all());
+
+        // Schedule the refresh before expiry and defer execution until its hard boundary.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS - 1));
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
+        self::assertNotNull($cache->get($key));
+        app(DeferredCallbackCollection::class)->invoke();
+
+        // Keep the expired generation only for validation without starting another transfer.
+        Http::assertSentCount(1);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+
+        // Let the next caller fetch its replacement through the ordinary foreground path.
+        $replacement = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION, $replacement->json('version'));
+        Http::assertSentCount(2);
     }
 
     /**
@@ -277,7 +350,8 @@ final class CacheLifecycleTest extends TestCase
         Http::fakeSequence()
             ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
             ->push(['error' => 'Unavailable'], HttpStatus::HTTP_SERVICE_UNAVAILABLE)
-            ->push(['error' => 'Unavailable'], HttpStatus::HTTP_SERVICE_UNAVAILABLE);
+            ->push(['error' => 'Unavailable'], HttpStatus::HTTP_SERVICE_UNAVAILABLE)
+            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK);
 
         // Populate the initial response and move it into the stale period.
         Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
@@ -297,6 +371,12 @@ final class CacheLifecycleTest extends TestCase
         // Complete the newly scheduled callback to keep the test lifecycle isolated.
         app(DeferredCallbackCollection::class)->invoke();
         Http::assertSentCount(3);
+
+        // Retaining the failed generation must not extend the response's original lifetime.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
+        $expired = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION, $expired->json('version'));
+        Http::assertSentCount(4);
     }
 
     /**
@@ -418,9 +498,14 @@ final class CacheLifecycleTest extends TestCase
     }
 
     /**
-     * Confirm a refresh does not restore an entry explicitly removed before expiry.
+     * Confirm explicit invalidation cancels a refresh even when it completes after expiry.
+     *
+     * @param  int  $invalidatedAfterSeconds  The response age when its entry is removed.
+     * @param  int  $completedAfterSeconds  The response age when the refresh finishes.
+     * @param  bool  $flush  Whether invalidation clears the whole cache store.
      */
-    public function test_refresh_does_not_restore_an_entry_removed_before_expiry(): void
+    #[DataProvider('refreshInvalidationTimes')]
+    public function test_refresh_does_not_restore_an_invalidated_entry(int $invalidatedAfterSeconds, int $completedAfterSeconds, bool $flush): void
     {
         // Freeze time and prepare a refresh whose body invalidates the original entry.
         $startedAt = Carbon::parse(self::STARTED_AT);
@@ -432,16 +517,25 @@ final class CacheLifecycleTest extends TestCase
         $refreshBody = FnStream::decorate($body, [
             'getContents' =>
                 /**
-                 * Simulate explicit invalidation while the original response is unexpired.
+                 * Remove the original generation before completing the deferred transfer.
                  *
                  * @return string The successful deferred response body.
                  */
-                static function () use ($cache, $body): string {
-                    // Forget the original generation without advancing its expiry time.
+                static function () use ($cache, $body, $startedAt, $invalidatedAfterSeconds, $completedAfterSeconds, $flush): string {
+                    // Remove the cache slot independently of its logical expiry time.
                     $key = array_key_first($cache->getStore()->all());
-                    $cache->forget($key);
+                    Carbon::setTestNow($startedAt->copy()->addSeconds($invalidatedAfterSeconds));
 
-                    // Finish capture after the cache slot has been explicitly removed.
+                    // Cover targeted removal and a store flush while the refresh is in flight.
+                    if ($flush) {
+                        $cache->flush();
+                    } else {
+                        $cache->forget($key);
+                    }
+
+                    // Finish capture at or after invalidation, including across hard expiry.
+                    Carbon::setTestNow($startedAt->copy()->addSeconds($completedAfterSeconds));
+
                     return $body->getContents();
                 },
         ]);
@@ -449,18 +543,44 @@ final class CacheLifecycleTest extends TestCase
         // Populate the cache before preparing its successful deferred response.
         Http::fakeSequence()
             ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
-            ->push($refreshBody, HttpStatus::HTTP_OK);
+            ->push($refreshBody, HttpStatus::HTTP_OK)
+            ->push(['version' => self::UPDATED_VERSION + 1], HttpStatus::HTTP_OK);
         Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
         $key = array_key_first($cache->getStore()->all());
 
-        // Refresh during the stale period while the original generation remains unexpired.
-        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        // Start the refresh while its original generation is still inside the lifetime.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS - 2));
         Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
         app(DeferredCallbackCollection::class)->invoke();
 
         // Keep the explicit invalidation instead of storing the completed refresh.
         self::assertNull($cache->get($key));
         Http::assertSentCount(2);
+
+        // Let the next caller populate the invalidated slot through a new foreground request.
+        $replacement = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame(self::UPDATED_VERSION + 1, $replacement->json('version'));
+        self::assertNotNull($cache->get($key));
+        Http::assertSentCount(3);
+    }
+
+    /**
+     * Provide explicit invalidations before, at, and after the original expiry boundary.
+     *
+     * @return iterable<string, array{int, int, bool}> Invalidation and completion ages with the removal mode.
+     */
+    public static function refreshInvalidationTimes(): iterable
+    {
+        // Keep targeted removals effective throughout the bounded refresh window.
+        yield 'before expiry' => [self::LIFETIME_SECONDS - 1, self::LIFETIME_SECONDS - 1, false];
+        yield 'completion at expiry' => [self::LIFETIME_SECONDS - 1, self::LIFETIME_SECONDS, false];
+        yield 'completion after expiry' => [self::LIFETIME_SECONDS - 1, self::LIFETIME_SECONDS + 1, false];
+        yield 'invalidation at expiry' => [self::LIFETIME_SECONDS, self::LIFETIME_SECONDS + 1, false];
+        yield 'invalidation after expiry' => [self::LIFETIME_SECONDS + 1, self::LIFETIME_SECONDS + 2, false];
+
+        // A store flush must also cancel work that started before its original expiry.
+        yield 'flush across expiry' => [self::LIFETIME_SECONDS - 1, self::LIFETIME_SECONDS + 1, true];
+        yield 'flush after expiry' => [self::LIFETIME_SECONDS + 1, self::LIFETIME_SECONDS + 2, true];
     }
 
     /**
