@@ -111,7 +111,7 @@ final class HttpRememberMiddleware
                         // Contain scheduling failures while preserving the cache hit.
                         try {
                             // Defer a refresh of the generation served to this caller.
-                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached->id());
+                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached);
                         } catch (Throwable $exception) {
                             // Report the scheduling failure using safe exception metadata.
                             $this->logFailure('refresh', $key, ['exception' => $exception::class]);
@@ -215,7 +215,7 @@ final class HttpRememberMiddleware
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  Repository  $cache  The selected Laravel cache repository.
      * @param  string  $key  The generated response cache key.
-     * @param  string|null  $generation  The generation to replace, or null for a cache miss.
+     * @param  HttpRememberResponse|null  $generation  The response to replace, or null for a cache miss.
      * @return PromiseInterface The original response with cache persistence attached.
      */
     private function sendAndRemember(
@@ -224,7 +224,7 @@ final class HttpRememberMiddleware
         array $options,
         Repository $cache,
         string $key,
-        ?string $generation = null,
+        ?HttpRememberResponse $generation = null,
     ): PromiseInterface {
         // Leave rejected promises and Laravel's foreground error handling unchanged.
         return $handler($request, $options)->then(
@@ -261,8 +261,11 @@ final class HttpRememberMiddleware
                                 $current = null;
                             }
 
-                            // Preserve responses another caller stored while this request was pending.
-                            if ($current?->id() !== $generation) {
+                            // Allow a completed refresh to repopulate its naturally expired entry.
+                            $expiredDuringRefresh = $current === null && $generation?->hasReached($this->settings->lifetime);
+
+                            // Preserve other generations and missing entries that should still be unexpired.
+                            if ($current?->id() !== $generation?->id() && ! $expiredDuringRefresh) {
                                 return;
                             }
 
@@ -301,7 +304,7 @@ final class HttpRememberMiddleware
      * @param  array<string, mixed>  $options  The original Guzzle transfer options.
      * @param  Repository  $cache  The selected Laravel cache repository.
      * @param  string  $key  The generated response cache key.
-     * @param  string  $generation  The stale entry's generation identifier.
+     * @param  HttpRememberResponse  $generation  The stale response and its original expiry metadata.
      */
     private function refreshLater(
         callable $handler,
@@ -309,7 +312,7 @@ final class HttpRememberMiddleware
         array $options,
         Repository $cache,
         string $key,
-        string $generation,
+        HttpRememberResponse $generation,
     ): void {
         // Retain the original stream while preparing an independent deferred request.
         $body = $request->getBody();
@@ -358,7 +361,7 @@ final class HttpRememberMiddleware
                          */
                         function () use ($handler, $request, $options, $cache, $key, $generation): void {
                             // Avoid repeating work after another worker replaces the entry.
-                            if (HttpRememberResponse::restore($cache->get($key))?->id() !== $generation) {
+                            if (HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id()) {
                                 return;
                             }
 
