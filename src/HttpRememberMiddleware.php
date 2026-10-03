@@ -8,11 +8,13 @@ use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use ReflectionFunction;
 use RuntimeException;
 use Throwable;
 
@@ -63,6 +65,24 @@ final class HttpRememberMiddleware
      */
     public function __invoke(callable $handler): callable
     {
+        // Keep callback bindings local to this handler stack when builders share middleware.
+        $canCache = $this->canCache;
+        $onHit = $this->onHit;
+
+        // Laravel's next before-sending handler belongs to the builder sending this request.
+        if ((new ReflectionFunction($canCache))->getClosureThis() instanceof PendingRequest) {
+            $pendingRequest = $handler instanceof Closure ? (new ReflectionFunction($handler))->getClosureThis() : null;
+
+            // Bypass caching when later middleware obscures the builder's preparation handler.
+            if (! $pendingRequest instanceof PendingRequest) {
+                return $handler;
+            }
+
+            // Rebind cloned callbacks without changing the original builder's middleware.
+            $canCache = $canCache->bindTo($pendingRequest, PendingRequest::class);
+            $onHit = $onHit->bindTo($pendingRequest, PendingRequest::class);
+        }
+
         // Keep the original promise contract on both cache hits and network requests.
         return
             /**
@@ -72,9 +92,9 @@ final class HttpRememberMiddleware
              * @param  array<string, mixed>  $options  The Guzzle transfer options.
              * @return PromiseInterface The cached or live response promise.
              */
-            function (RequestInterface $request, array $options) use ($handler): PromiseInterface {
+            function (RequestInterface $request, array $options) use ($handler, $canCache, $onHit): PromiseInterface {
                 // Avoid consuming uploads, streams, or downloads with transfer side effects.
-                if ($this->shouldBypassCache($request, $options)) {
+                if ($this->shouldBypassCache($request, $options, $canCache)) {
                     return $handler($request, $options);
                 }
 
@@ -104,7 +124,7 @@ final class HttpRememberMiddleware
                 // Keep application event failures outside cache failure handling.
                 if ($response !== null) {
                     // Restore Laravel's request metadata and events for the cached response.
-                    ($this->onHit)($request, $options);
+                    $onHit($request, $options);
 
                     // Keep a usable stale response even if refresh scheduling fails.
                     if ($cached->hasReached($this->settings->fresh)) {
@@ -132,12 +152,13 @@ final class HttpRememberMiddleware
      *
      * @param  RequestInterface  $request  The prepared outgoing request.
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
+     * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
      * @return bool Whether the request must pass through without caching.
      */
-    private function shouldBypassCache(RequestInterface $request, array $options): bool
+    private function shouldBypassCache(RequestInterface $request, array $options, Closure $canCache): bool
     {
         // Avoid caching an identity that a later middleware or callback might change.
-        if (! ($this->canCache)()) {
+        if (! $canCache()) {
             return true;
         }
 
