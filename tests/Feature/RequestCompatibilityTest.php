@@ -407,6 +407,120 @@ final class RequestCompatibilityTest extends TestCase
     }
 
     /**
+     * Confirm later request callbacks cancel refreshes without changing cached credentials.
+     */
+    public function test_deferred_refresh_skips_later_before_sending_callbacks(): void
+    {
+        // Freeze time before populating the response for the original credentials.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+
+        // Return the credentials received by the handler so identity changes remain observable.
+        Http::fake(
+            /**
+             * Identify the account used by each live request.
+             *
+             * @param  Request  $request  The outgoing fake request.
+             * @return PromiseInterface The successful response containing the request's credentials.
+             */
+            static fn (Request $request): PromiseInterface => Http::response([
+                'account' => $request->header('Authorization')[0],
+            ]));
+
+        // Retain the original response and expiry for comparison after deferred execution.
+        Http::withToken('alice')->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+
+        // Schedule a refresh while the response for the original credentials is stale.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        $pending = Http::withToken('alice')->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS]);
+        self::assertSame('Bearer alice', $pending->get(self::API_URL)->json('account'));
+        self::assertCount(1, app(DeferredCallbackCollection::class));
+
+        // Reuse the builder with a callback that changes the outgoing credentials.
+        $pending->beforeSending(
+            /**
+             * Replace the credentials after the original cache key was calculated.
+             *
+             * @param  Request  $request  The outgoing request prepared by Laravel.
+             * @return RequestInterface The request carrying the second account's credentials.
+             */
+            static fn (Request $request): RequestInterface => $request->toPsrRequest()
+                ->withHeader('Authorization', 'Bearer bob'));
+
+        // Send the changed foreground request before executing the earlier deferred refresh.
+        self::assertSame('Bearer bob', $pending->get(self::API_URL)->json('account'));
+        app(DeferredCallbackCollection::class)->invoke();
+
+        // Confirm cancellation preserved the original response and expiry without another transfer.
+        self::assertSame($cached, $cache->all());
+        self::assertSame('Bearer alice', Http::withToken('alice')
+            ->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL)->json('account'));
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm deferred mutation checks belong to the clone that scheduled the refresh.
+     *
+     * @param  bool  $mutateClone  Whether the later middleware belongs to the sending clone.
+     */
+    #[DataProvider('deferredCloneMutationTargets')]
+    public function test_deferred_refresh_checks_the_sending_clones_mutations(bool $mutateClone): void
+    {
+        // Freeze time and populate the initial response before creating the cloned builder.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $this->fakeVersionSequence();
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+
+        // Clone the builder so both instances initially share the same cache middleware.
+        $original = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS]);
+        $clone = clone $original;
+
+        // Separate the middleware collections while retaining the clone's inherited callback bindings.
+        $original->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS]);
+
+        // Schedule the stale refresh through the cloned builder.
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        self::assertSame(self::INITIAL_VERSION, $clone->get(self::API_URL)->json('version'));
+        self::assertCount(1, app(DeferredCallbackCollection::class));
+
+        // Add later middleware to only the selected builder after scheduling the refresh.
+        ($mutateClone ? $clone : $original)->withRequestMiddleware(
+            /**
+             * Represent a later middleware that changes the selected builder's credentials.
+             *
+             * @param  RequestInterface  $request  The outgoing request entering the middleware.
+             * @return RequestInterface The request carrying the replacement credentials.
+             */
+            static fn (RequestInterface $request): RequestInterface => $request->withHeader('Authorization', 'Bearer later-token'),
+        );
+
+        // Execute the deferred callback after the selected builder's state has changed.
+        app(DeferredCallbackCollection::class)->invoke();
+
+        // Confirm only mutations to the sending clone cancel its refresh.
+        $response = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+        self::assertSame($mutateClone ? self::INITIAL_VERSION : self::UPDATED_VERSION, $response->json('version'));
+        Http::assertSentCount($mutateClone ? 1 : 2);
+    }
+
+    /**
+     * Provide mutations that should cancel or preserve the clone's deferred refresh.
+     *
+     * @return iterable<string, array{bool}> Mutation targets keyed by their expected refresh behavior.
+     */
+    public static function deferredCloneMutationTargets(): iterable
+    {
+        // Cancel refreshes when later middleware belongs to the sending clone.
+        yield 'mutated clone cancels refresh' => [true];
+
+        // Preserve refreshes when only the original builder receives later middleware.
+        yield 'mutated original preserves clone refresh' => [false];
+    }
+
+    /**
      * Confirm asynchronous requests retain their promise contract on cache hits.
      */
     public function test_async_requests_are_remembered(): void

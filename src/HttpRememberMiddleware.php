@@ -131,7 +131,7 @@ final class HttpRememberMiddleware
                         // Contain scheduling failures while preserving the cache hit.
                         try {
                             // Defer a refresh of the generation served to this caller.
-                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached);
+                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache);
                         } catch (Throwable $exception) {
                             // Report the scheduling failure using safe exception metadata.
                             $this->logFailure('refresh', $key, ['exception' => $exception::class]);
@@ -329,6 +329,7 @@ final class HttpRememberMiddleware
      * @param  Repository  $cache  The selected Laravel cache repository.
      * @param  string  $key  The generated response cache key.
      * @param  HttpRememberResponse  $generation  The stale response and its original expiry metadata.
+     * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
      */
     private function refreshLater(
         callable $handler,
@@ -337,6 +338,7 @@ final class HttpRememberMiddleware
         Repository $cache,
         string $key,
         HttpRememberResponse $generation,
+        Closure $canCache,
     ): void {
         // Retain the original stream while preparing an independent deferred request.
         $body = $request->getBody();
@@ -373,7 +375,7 @@ final class HttpRememberMiddleware
              *
              * @return void
              */
-            function () use ($handler, $request, $options, $cache, $key, $generation): void {
+            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache): void {
                 // Contain refresh failures after the caller has received its response.
                 try {
                     // Recheck the generation after acquiring any available refresh lock.
@@ -383,10 +385,15 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($handler, $request, $options, $cache, $key, $generation): void {
+                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache): void {
                             // Skip expired generations and entries removed or replaced before execution.
                             if ($generation->hasReached($this->settings->lifetime)
                                 || HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id()) {
+                                return;
+                            }
+
+                            // Cancel refreshes when later builder mutations could change the cached request's identity.
+                            if (! $canCache()) {
                                 return;
                             }
 
