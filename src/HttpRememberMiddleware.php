@@ -343,13 +343,19 @@ final class HttpRememberMiddleware
         // Retain the original stream while preparing an independent deferred request.
         $body = $request->getBody();
 
+        // Remember the cursor left by request events before reading the complete upload.
+        $position = $body->tell();
+
         // Copy the body without changing the caller's request stream position.
         try {
+            // Include bytes already consumed by request logging or other body inspection.
+            $body->rewind();
+
             // Give the deferred request its own replayable upload stream.
             $request = $request->withBody(Utils::streamFor($body->getContents()));
         } finally {
-            // Restore the caller's upload after preparing the deferred copy.
-            $body->rewind();
+            // Restore the caller's original cursor even when copying the body fails.
+            $body->seek($position);
         }
 
         // Preserve shorter timeouts while bounding every deferred network timeout.
