@@ -18,6 +18,7 @@ use PhilipAnnis\HttpRemember\Tests\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
 
 /**
  * Verify remembered requests through Laravel's public HTTP client API.
@@ -194,6 +195,99 @@ final class RequestCompatibilityTest extends TestCase
         self::assertSame($secondPost->json(), $secondPostAgain->json());
         self::assertSame($get->json(), $getAgain->json());
         Http::assertSentCount(3);
+    }
+
+    /**
+     * Confirm request body inspection cannot truncate a deferred POST refresh.
+     *
+     * @param  int|null  $readBytes  The number of bytes inspected, or null to log the complete body.
+     */
+    #[DataProvider('requestBodyInspectionLengths')]
+    public function test_deferred_refresh_preserves_inspected_request_bodies(?int $readBytes): void
+    {
+        // Freeze time and prepare the payload that every live transfer must receive.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $payload = ['query' => 'linen'];
+        $expectedBody = json_encode($payload, JSON_THROW_ON_ERROR);
+        $observedBody = null;
+        $received = [];
+
+        // Inspect request bodies through Laravel's event without adding a before-sending callback.
+        app('events')->listen(RequestSending::class,
+            /**
+             * Consume the request body as an application logger or inspector would.
+             *
+             * @param  RequestSending  $event  The request prepared for a live transfer or cache hit.
+             */
+            static function (RequestSending $event) use ($readBytes, &$observedBody): void {
+                // Retain the shared stream so its cursor can be checked after refresh scheduling.
+                $observedBody = $event->request->toPsrRequest()->getBody();
+
+                // Cover ordinary body logging and an inspector that reads only a prefix.
+                if ($readBytes === null) {
+                    $event->request->body();
+                } else {
+                    $observedBody->read($readBytes);
+                }
+            },
+        );
+
+        // Record the complete body and declared length received by each live request.
+        Http::fake(
+            /**
+             * Return a distinct response generation containing the received request body.
+             *
+             * @param  Request  $request  The outgoing fake request.
+             * @return PromiseInterface The successful response for this transfer.
+             */
+            static function (Request $request) use (&$received): PromiseInterface {
+                // Observe body bytes independently of the stream cursor left by request events.
+                $body = $request->body();
+                $received[] = ['body' => $body, 'length' => $request->header('Content-Length')];
+
+                // Distinguish a completed refresh from another read of the original cached response.
+                return Http::response(['version' => count($received), 'body' => $body]);
+            },
+        );
+
+        // Populate the initial response before scheduling a refresh from the stale cache hit.
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+        Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
+        $stale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+        self::assertSame(self::INITIAL_VERSION, $stale->json('version'));
+        self::assertCount(1, app(DeferredCallbackCollection::class));
+
+        // Confirm copying the refresh body preserved the cursor left by the event listener.
+        self::assertInstanceOf(StreamInterface::class, $observedBody);
+        self::assertSame($readBytes ?? strlen($expectedBody), $observedBody->tell());
+
+        // Execute the refresh and read its newly remembered response.
+        app(DeferredCallbackCollection::class)->invoke();
+        $refreshed = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+
+        // Confirm both live transfers used the complete payload and matching content length.
+        self::assertSame([
+            ['body' => $expectedBody, 'length' => [(string) strlen($expectedBody)]],
+            ['body' => $expectedBody, 'length' => [(string) strlen($expectedBody)]],
+        ], $received);
+        self::assertSame(self::UPDATED_VERSION, $refreshed->json('version'));
+        self::assertSame($expectedBody, $refreshed->json('body'));
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Provide request body reads that move the cursor before refresh scheduling.
+     *
+     * @return iterable<string, array{int|null}> Read lengths keyed by inspection behavior.
+     */
+    public static function requestBodyInspectionLengths(): iterable
+    {
+        // Cover ordinary logging that leaves the request stream at the end of its body.
+        yield 'complete body logging' => [null];
+
+        // Cover partial inspection that would otherwise copy only the unread suffix.
+        yield 'partial body inspection' => [5];
     }
 
     /**
