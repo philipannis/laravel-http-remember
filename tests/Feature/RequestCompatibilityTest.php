@@ -304,6 +304,68 @@ final class RequestCompatibilityTest extends TestCase
     }
 
     /**
+     * Confirm trailer callbacks bypass cache reads, writes, and deferred refreshes.
+     *
+     * @param  int|null  $age  The cached response age, or null when the cache is empty.
+     */
+    #[DataProvider('trailerCallbackCacheStates')]
+    public function test_trailer_callbacks_bypass_the_cache(?int $age): void
+    {
+        // Freeze time and provide distinct responses for population and the live transfer.
+        $startedAt = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($startedAt);
+        $handler = new MockHandler([
+            new Response(HttpStatus::HTTP_OK, [], 'initial-response'),
+            new Response(HttpStatus::HTTP_OK, [], 'live-response'),
+        ]);
+
+        // Populate a fresh or stale entry when the test starts with an existing response.
+        if ($age !== null) {
+            Http::setHandler($handler)->preventStrayRequests(false)
+                ->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
+            Carbon::setTestNow($startedAt->copy()->addSeconds($age));
+        }
+
+        // Retain the original cache contents to detect unintended writes or expiry changes.
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+        $callback =
+            /**
+             * Represent trailer validation owned by the transport.
+             *
+             * @param  array<string, list<string>>  $trailers  The parsed response trailers.
+             * @param  ResponseInterface  $response  The completed live response.
+             */
+            static function (array $trailers, ResponseInterface $response): void {};
+
+        // Require a live transfer while preserving the callback supplied to Guzzle.
+        $response = Http::setHandler($handler)->preventStrayRequests(false)
+            ->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])
+            ->withOptions(['on_trailers' => $callback])->get(self::API_URL);
+
+        // Confirm the transport received the callback without reading or changing cached responses.
+        self::assertSame($age === null ? 'initial-response' : 'live-response', $response->body());
+        self::assertSame($callback, $handler->getLastOptions()['on_trailers']);
+        self::assertSame($cached, $cache->all());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+    }
+
+    /**
+     * Provide cache states that must preserve live trailer validation.
+     *
+     * @return iterable<string, array{int|null}> Response ages keyed by cache state.
+     */
+    public static function trailerCallbackCacheStates(): iterable
+    {
+        // Prevent responses requiring trailer validation from populating an empty cache.
+        yield 'cache miss' => [null];
+
+        // Bypass existing responses throughout their fresh and stale periods.
+        yield 'fresh response' => [0];
+        yield 'stale response' => [self::FRESH_SECONDS];
+    }
+
+    /**
      * Confirm custom cURL options bypass response caching.
      */
     public function test_custom_curl_options_bypass_the_cache(): void

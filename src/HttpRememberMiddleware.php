@@ -162,8 +162,8 @@ final class HttpRememberMiddleware
             return true;
         }
 
-        // Preserve Guzzle's header callbacks and their normal rejection handling.
-        if (isset($options['on_headers'])) {
+        // Preserve Guzzle's header and trailer callbacks and their normal rejection handling.
+        if (isset($options['on_headers']) || isset($options['on_trailers'])) {
             return true;
         }
 
