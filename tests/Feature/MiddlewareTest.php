@@ -3,12 +3,16 @@
 namespace PhilipAnnis\HttpRemember\Tests\Feature;
 
 use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Handler\CurlFactory;
+use GuzzleHttp\Handler\CurlFactoryInterface;
+use GuzzleHttp\Handler\EasyHandle;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\Promise;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
+use GuzzleHttp\RequestOptions;
 use Illuminate\Cache\Events\WritingKey;
 use Illuminate\Cache\Repository;
 use Illuminate\Contracts\Cache\Store;
@@ -19,6 +23,7 @@ use Mockery;
 use PhilipAnnis\HttpRemember\HttpRememberMiddleware;
 use PhilipAnnis\HttpRemember\HttpRememberOptions;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
+use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 
@@ -91,6 +96,80 @@ final class MiddlewareTest extends TestCase
 
         // Confirm the failed live request did not replace the existing remembered response.
         self::assertCount(0, $transport);
+        self::assertSame($cached, $cache->all());
+    }
+
+    /**
+     * Confirm trailer validation failures reject promises even when a response is cached.
+     */
+    public function test_trailer_callback_rejections_bypass_existing_fresh_responses(): void
+    {
+        // Exercise Guzzle's trailer handling only on versions that provide this transport option.
+        if (! defined(RequestOptions::class.'::ON_TRAILERS')) {
+            self::markTestSkipped('This Guzzle version does not support on_trailers callbacks.');
+        }
+
+        // Release in-memory transfers without allocating real cURL handles or reaching the network.
+        $factory = Mockery::mock(CurlFactoryInterface::class);
+        $factory->shouldReceive('release')->twice();
+        $handler = $this->middleware()(
+            /**
+             * Complete a response through Guzzle's normal trailer callback handling.
+             *
+             * @param  RequestInterface  $request  The outgoing request entering the transport.
+             * @param  array<string, mixed>  $options  The transfer options supplied by the caller.
+             * @return PromiseInterface The completed or rejected transfer promise.
+             */
+            static function (RequestInterface $request, array $options) use ($factory): PromiseInterface {
+                // Provide a completed response and invalid digest trailer for validation.
+                $easy = new EasyHandle;
+                $easy->request = $request;
+                $easy->response = new Response(HttpStatus::HTTP_OK, [], 'response-body');
+                $easy->trailers = ['Digest: invalid'];
+                $easy->options = $options;
+
+                // Let Guzzle invoke the callback and wrap any application validation failure.
+                return CurlFactory::finish(new MockHandler, $easy, $factory);
+            },
+        );
+
+        // Populate the cache before requiring trailer validation on the same request.
+        $request = new Request('GET', self::API_URL);
+        self::assertSame('response-body', (string) $handler($request, [])->wait()->getBody());
+        $cache = Cache::store()->getStore();
+        $cached = $cache->all();
+        $failure = new RuntimeException('Test trailer validation failure.');
+
+        // Reject the live response through the transport's normal trailer hook.
+        $promise = $handler($request, ['on_trailers' =>
+            /**
+             * Reject a completed response whose digest trailer does not validate.
+             *
+             * @param  array<string, list<string>>  $trailers  The parsed response trailers.
+             * @param  ResponseInterface  $response  The completed live response.
+             */
+            static function (array $trailers, ResponseInterface $response) use ($failure): void {
+                // Confirm Guzzle supplied the live trailers and response before rejecting them.
+                self::assertSame(['digest' => ['invalid']], $trailers);
+                self::assertSame('response-body', (string) $response->getBody());
+
+                // Preserve the application failure as the cause of Guzzle's rejected promise.
+                throw $failure;
+            },
+        ]);
+
+        // Resolve the promise and confirm the remembered response did not bypass validation.
+        try {
+            $promise->wait();
+
+            // Fail explicitly if the cached response skipped trailer validation.
+            self::fail('The remembered request did not reject the trailer validation failure.');
+        } catch (RequestException $exception) {
+            // Confirm Guzzle retained the application's original validation exception.
+            self::assertSame($failure, $exception->getPrevious());
+        }
+
+        // Keep the existing response and expiry unchanged after the rejected live transfer.
         self::assertSame($cached, $cache->all());
     }
 
