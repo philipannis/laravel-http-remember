@@ -6,6 +6,7 @@ use InvalidArgumentException;
 use PhilipAnnis\HttpRemember\HttpRememberOptions;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use TypeError;
 
 /**
  * Verify immutable HTTP cache policy validation.
@@ -43,6 +44,7 @@ final class OptionsTest extends TestCase
         self::assertSame(self::FIXED_LIFETIME_SECONDS, $options->fresh);
         self::assertSame(self::FIXED_LIFETIME_SECONDS, $options->lifetime);
         self::assertNull($options->store);
+        self::assertNull($options->operation);
         self::assertSame(self::REFRESH_TIMEOUT_SECONDS, $options->refreshTimeout);
     }
 
@@ -143,5 +145,123 @@ final class OptionsTest extends TestCase
 
         // Attempt to create a policy without a usable store name.
         new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, '   ', self::REFRESH_TIMEOUT_SECONDS);
+    }
+
+    /**
+     * Confirm unsupported operation values cannot create a request policy.
+     *
+     * @param  mixed  $operation  The unsupported operation value.
+     * @param  class-string<\Throwable>  $exception  The expected validation or type error.
+     */
+    #[DataProvider('invalidOperations')]
+    public function test_invalid_operation_is_rejected(mixed $operation, string $exception): void
+    {
+        // Reject unsupported values before a request policy can reach the middleware.
+        $this->expectException($exception);
+
+        // Attempt to select an invalid operation using an otherwise valid cache policy.
+        new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, null, self::REFRESH_TIMEOUT_SECONDS, operation: $operation);
+    }
+
+    /**
+     * Provide operation values outside the supported read override.
+     *
+     * @return iterable<string, array{mixed, class-string<\Throwable>}> Invalid operations keyed by purpose.
+     */
+    public static function invalidOperations(): iterable
+    {
+        // Reject unknown names without guessing or normalizing the caller's intent.
+        yield 'empty name' => ['', InvalidArgumentException::class];
+        yield 'removed write name' => ['write', InvalidArgumentException::class];
+        yield 'automatic name' => ['auto', InvalidArgumentException::class];
+        yield 'method name' => ['POST', InvalidArgumentException::class];
+        yield 'uppercase read' => ['READ', InvalidArgumentException::class];
+        yield 'padded write' => ['write ', InvalidArgumentException::class];
+
+        // Reject scalar coercions and values incompatible with the string parameter.
+        yield 'true' => [true, InvalidArgumentException::class];
+        yield 'false' => [false, InvalidArgumentException::class];
+        yield 'integer' => [1, InvalidArgumentException::class];
+        yield 'array' => [[], TypeError::class];
+    }
+
+    /**
+     * Confirm group order cannot change the normalized invalidation identity.
+     */
+    public function test_group_order_is_normalized(): void
+    {
+        // Select the same group in opposite orders without changing its values.
+        $first = new HttpRememberOptions(60, null, 15, ['tenant:42', 'products']);
+        $second = new HttpRememberOptions(60, null, 15, ['products', 'tenant:42']);
+
+        // Preserve one sorted list and one hash for both requests.
+        self::assertSame(['products', 'tenant:42'], $first->group);
+        self::assertSame($first->group, $second->group);
+        self::assertSame($first->groupHash, $second->groupHash);
+    }
+
+    /**
+     * Confirm omission and an explicitly empty group produce the same policy.
+     */
+    public function test_empty_group_is_the_same_as_omission(): void
+    {
+        // Compare ordinary remembering with an explicitly selected empty group.
+        $omitted = new HttpRememberOptions(60, null, 15);
+        $empty = new HttpRememberOptions(60, null, 15, []);
+
+        // Normalize both cases to ordinary remembering without an invalidation identity.
+        self::assertNull($omitted->group);
+        self::assertNull($omitted->groupHash);
+        self::assertSame($omitted->group, $empty->group);
+        self::assertSame($omitted->groupHash, $empty->groupHash);
+    }
+
+    /**
+     * Confirm delimiter characters, duplicate values, case, and whitespace remain distinct.
+     */
+    public function test_group_values_are_preserved_exactly(): void
+    {
+        // Select groups that must not alias through joining, trimming, or deduplication.
+        $groups = [['a:b', 'c'], ['a', 'b:c'], ['a:b', 'c', 'c'], ['A:b', 'c'], ['a:b ', 'c']];
+        $hashes = [];
+
+        // Collect each complete group's identity for comparison.
+        foreach ($groups as $group) {
+            $hashes[] = (new HttpRememberOptions(60, null, 15, $group))->groupHash;
+        }
+
+        // Every different complete list must have its own identity.
+        self::assertCount(count($groups), array_unique($hashes));
+    }
+
+    /**
+     * Confirm malformed group values fail before middleware can be attached.
+     *
+     * @param  array<mixed>  $group  The invalid group definition.
+     */
+    #[DataProvider('invalidGroups')]
+    public function test_invalid_group_is_rejected(array $group): void
+    {
+        // Keep invalid identities visible during policy construction.
+        $this->expectException(InvalidArgumentException::class);
+
+        // Attempt to select values that cannot form a supported group.
+        new HttpRememberOptions(60, null, 15, $group);
+    }
+
+    /**
+     * Provide group definitions with unsupported keys or values.
+     *
+     * @return iterable<string, array{array<mixed>}> Invalid groups keyed by purpose.
+     */
+    public static function invalidGroups(): iterable
+    {
+        // Require non-empty string values in a positional list.
+        yield 'associative list' => [['tenant' => '42']];
+        yield 'empty value' => [['']];
+        yield 'whitespace value' => [['   ']];
+        yield 'integer value' => [[42]];
+        yield 'null value' => [[null]];
+        yield 'nested group' => [[['products']]];
     }
 }

@@ -22,18 +22,34 @@ final readonly class HttpRememberOptions
     public int $lifetime;
 
     /**
+     * The sorted values identifying one invalidation group.
+     *
+     * @var list<string>|null
+     */
+    public ?array $group;
+
+    /**
+     * The hashed group identity shared across URLs, credentials, and lifetimes.
+     */
+    public ?string $groupHash;
+
+    /**
      * Create a fixed-expiry or stale-while-revalidate policy.
      *
      * @param  int|array{int, int}  $ttl  A positive lifetime or [fresh, total lifetime].
      * @param  string|null  $store  A configured Laravel cache store, or the default store.
      * @param  int  $refreshTimeout  The maximum deferred network timeout in seconds.
+     * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
+     * @param  'read'|null  $operation  Read caches any eligible method; null uses automatic detection.
      *
-     * @throws InvalidArgumentException When a duration or cache store name is invalid.
+     * @throws InvalidArgumentException When a duration, cache store, group, or operation is invalid.
      */
     public function __construct(
         int|array $ttl,
         public ?string $store,
         public int $refreshTimeout,
+        ?array $group = null,
+        public ?string $operation = null,
     ) {
         // Require a positive timeout for deferred network work.
         if ($refreshTimeout <= 0) {
@@ -44,6 +60,33 @@ final readonly class HttpRememberOptions
         if ($store !== null && trim($store) === '') {
             throw new InvalidArgumentException('The HTTP remember cache store must be a non-empty name or null.');
         }
+
+        // Reserve null for automatic detection and accept only explicit read intent.
+        if ($operation !== null && $operation !== 'read') {
+            throw new InvalidArgumentException('The HTTP remember operation must be read when provided.');
+        }
+
+        // Treat an empty group as ordinary remembering, just like omission.
+        $group = $group === [] ? null : $group;
+
+        // Require a positional list instead of silently discarding group keys.
+        if ($group !== null && ! array_is_list($group)) {
+            throw new InvalidArgumentException('The HTTP remember group must be a list of non-empty strings.');
+        }
+
+        // Preserve exact values while rejecting names that cannot identify a group.
+        foreach ($group ?? [] as $value) {
+            if (! is_string($value) || trim($value) === '') {
+                throw new InvalidArgumentException('The HTTP remember group must be a list of non-empty strings.');
+            }
+        }
+
+        // Make ordering irrelevant without joining values with an ambiguous delimiter.
+        if ($group !== null) {
+            sort($group, SORT_STRING);
+        }
+        $this->group = $group;
+        $this->groupHash = $group === null ? null : hash('sha256', serialize($group));
 
         // Treat an integer as a lifetime with no stale period.
         if (is_int($ttl)) {

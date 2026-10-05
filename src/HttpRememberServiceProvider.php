@@ -4,6 +4,7 @@ namespace PhilipAnnis\HttpRemember;
 
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\ServiceProvider;
+use InvalidArgumentException;
 use Psr\Http\Message\RequestInterface;
 
 /**
@@ -47,22 +48,31 @@ class HttpRememberServiceProvider extends ServiceProvider
         // Register the macro on PendingRequest so every fluent entry point works.
         PendingRequest::macro('remember',
             /**
-             * Remember successful responses using an optional per-request policy.
+             * Remember reads or invalidate a group after successful mutations.
              *
              * @param  int|array{int, int}|null  $ttl  A lifetime, thresholds, or configured default.
              * @param  string|null  $store  A cache store override, or the configured default.
+             * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
+             * @param  'read'|null  $operation  Explicit read intent; null is reserved for omission.
              * @return PendingRequest The same request builder for further chaining.
              *
-             * @throws \InvalidArgumentException When a cache policy is invalid.
+             * @throws InvalidArgumentException When a cache policy is invalid.
              */
-            function (int|array|null $ttl = null, ?string $store = null): PendingRequest {
+            function (int|array|null $ttl = null, ?string $store = null, ?array $group = null, ?string $operation = null): PendingRequest {
                 /** @var PendingRequest $this */
+
+                // Distinguish omission from an explicitly supplied null in the final argument.
+                if ($operation === null && func_num_args() >= 4) {
+                    throw new InvalidArgumentException('The HTTP remember operation must be read when provided.');
+                }
 
                 // Resolve configuration when called so requests do not share mutable policies.
                 $settings = new HttpRememberOptions(
                     $ttl ?? config('http-remember.ttl'),
                     $store ?? config('http-remember.store'),
                     config('http-remember.refresh_timeout'),
+                    $group,
+                    $operation,
                 );
 
                 // Replace an earlier policy instead of nesting multiple cache layers.

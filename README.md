@@ -4,7 +4,7 @@
 ![Laravel](https://img.shields.io/badge/Laravel-12%20%7C%2013-FF2D20?style=flat-square)
 [![License](https://img.shields.io/badge/license-MIT-334155?style=flat-square)](LICENSE)
 
-Add `remember()` to Laravel's HTTP client to cache successful API responses. It handles cache keys, response storage, and refreshes using your application's cache store. Requests without `remember()` work as usual.
+Add `remember()` to Laravel's HTTP client to cache successful API responses. It handles cache keys, response storage, and refreshes using your application's cache store. Use `group` to invalidate related cached reads after a live mutation. Requests without `remember()` skip the package entirely.
 
 ## Installation
 
@@ -95,7 +95,7 @@ $response = Http::remember([300, 900], store: 'redis')
 
 A fixed lifetime must be a positive integer. A fresh/stale pair must contain exactly two integers with `0 <= fresh < lifetime`. For example, `[0, 300]` makes every cache hit stale and expires it after five minutes. Invalid values throw `InvalidArgumentException` immediately.
 
-The store name comes from your application's `config/cache.php`. Arguments you leave out use the package configuration. Calling `remember()` again before sending replaces the previous settings. A reused request builder keeps its options, so start a new `Http` chain for unrelated requests.
+The store name comes from your application's `config/cache.php`. Lifetimes and stores you leave out use the package configuration. Calling `remember()` again before sending replaces the previous settings. A reused request builder keeps its options, so start a new `Http` chain for unrelated requests.
 
 ### Other HTTP methods
 
@@ -111,7 +111,88 @@ $results = Http::withToken(config('services.catalog.token'))
     ->json();
 ```
 
-Changing the payload creates a separate entry. Any HTTP method can use `remember()`, but the operation must be safe to skip on a cache hit and repeat during a refresh. **Don't cache payments, order creation, or other operations with side effects.**
+Changing the payload creates a separate entry. Without a group, any HTTP method uses the existing caching behavior. The operation must be safe to skip on a cache hit and repeat during a refresh. **Don't cache payments, order creation, or other operations with side effects.** Use a group for live mutations that should invalidate related reads.
+
+## Group related requests
+
+Give related requests the same `group`. Reads are cached; mutation methods run live and invalidate the group's cached reads after a non-error HTTP response:
+
+```php
+$group = ['tenant:42', 'products'];
+
+// Cache the product list and an individual product in the same group.
+$products = Http::remember(600, group: $group)
+    ->get('https://api.example.com/products');
+
+$product = Http::remember(300, group: $group)
+    ->get('https://api.example.com/products/42');
+
+// Send the update live and invalidate both cached reads after success.
+$updated = Http::remember(group: $group)
+    ->put('https://api.example.com/products/42', ['name' => 'Updated product']);
+
+// Fetch and cache an updated list on the next read.
+$products = Http::remember(600, group: $group)
+    ->get('https://api.example.com/products');
+```
+
+Order does not matter: `['tenant:42', 'products']` and `['products', 'tenant:42']` identify the same group. Matching uses the **complete array**, so `['products']` is a different group. Include a tenant or other scope when changes should affect only that scope.
+
+GET, HEAD, OPTIONS, and TRACE are treated as reads. Other methods, including POST, PUT, PATCH, and DELETE, are treated as mutations when a group is supplied. Mutations are never served from the cache, stored as cached responses, or repeated during deferred refreshes. A 2xx or 3xx response invalidates the group; 4xx, 5xx, and connection failures preserve it. Redirects invalidate before their follow-up requests run.
+
+### Cache POST searches and other reads
+
+Use `operation: 'read'` when a method normally associated with writes performs a read. This works for POST searches, reports, RPC calls, GraphQL queries, and other APIs:
+
+```php
+$group = ['tenant:42', 'products'];
+
+// Cache each search payload separately and invalidate it when the group changes.
+$results = Http::remember(600, group: $group, operation: 'read')
+    ->post('https://api.example.com/products/search', ['query' => 'linen'])
+    ->json();
+
+// A GraphQL query can also be a cacheable POST in the same group.
+$products = Http::remember(600, group: $group, operation: 'read')
+    ->post('https://api.example.com/graphql', [
+        'query' => 'query { products { id name } }',
+    ])
+    ->json();
+```
+
+Repeated identical reads use their own cached response. A successful grouped mutation invalidates all of them, even when their URLs, payloads, credentials, or lifetimes differ.
+
+You do not need `operation: 'read'` for ordinary GET requests or for POST reads without a group. Use it only for operations that are safe to skip on a cache hit and repeat during a refresh. For actual writes, including GraphQL mutations, leave it out so grouped mutation methods run live and invalidate the group. The package does not inspect payloads to determine the operation's intent.
+
+### Reuse a configured client
+
+Call `remember()` once on a shared request builder to avoid repeating the group:
+
+```php
+$api = Http::baseUrl('https://api.example.com')
+    ->remember(600, group: ['tenant:42', 'products']);
+
+$api->get('/products'); // Cache the read.
+$api->put('/products/42', ['name' => 'Updated product']); // Invalidate the group.
+$api->get('/products'); // Fetch and cache the updated list.
+```
+
+The selected `operation` stays on that builder too. Use `operation: 'read'` on builders dedicated to read operations; leave it unset on builders that mix ordinary reads and writes. Calling `remember()` again replaces the entire policy, including `group` and `operation`.
+
+### Request behavior
+
+| Usage | Behavior |
+| --- | --- |
+| No `remember()` | Ordinary live request with no package caching or invalidation. |
+| `remember()` with no group | Cache eligible responses for any method. |
+| `remember(group: [...])` | Cache reads and invalidate the group after live mutations. |
+| `remember(group: [...], operation: 'read')` | Cache an eligible read using any HTTP method. |
+
+Omit `operation` to use automatic method detection for grouped requests: a GET remains a cacheable read, while POST, PUT, PATCH, and DELETE run live and invalidate the group. When supplied, `operation` accepts only the exact string `'read'`, which enables caching for any eligible method. Other strings and explicit `null` throw `InvalidArgumentException`; unsupported argument types are also rejected. Operation settings retain the response eligibility and bypass rules below.
+
+To skip the package, simply omit `remember()`. A plain `Http::put(...)` does not invalidate remembered reads, even at the same URL. Opt related writes in with `remember(group: ...)` or use a builder that already carries that policy.
+
+Groups accept a positional array of non-empty strings. Values remain exact, including case, whitespace, and duplicate counts; associative arrays and non-string values throw `InvalidArgumentException`. Omitting `group`, passing `null`, or passing an empty array disables grouping and uses the same ordinary caching behavior.
 
 ## Configuration
 
@@ -161,6 +242,10 @@ Keys use the `http-remember:` prefix followed by a SHA-256 hash of the method, U
 
 Header names and their ordering are normalized. Header values, body bytes, and query ordering stay as sent. Different bearer tokens, basic credentials, cookie headers, bodies, or lifetimes get separate entries. URLs and credentials aren't written into keys as plaintext.
 
+Grouped keys also include the SHA-256 hash of the sorted group array and its current generation. Group values are not written into keys as plaintext. Requests without a group retain their original cache identity; `operation` does not change the identity of a cacheable response.
+
+Invalidation replaces one shared generation record instead of scanning response keys, so groups work without cache tags or atomic locks. Old responses become unreachable and expire at their existing backend lifetimes. The store retains one small generation record per group until it is replaced or removed. Missing metadata creates a fresh generation and never restores older cached responses.
+
 The cache stores arrays and scalars for the response's status, headers, body, protocol, reason phrase, and creation metadata. Each cache hit creates a normal `Illuminate\Http\Client\Response` with its own body stream. You can keep using `json()`, `body()`, `header()`, `successful()`, and `throw()`.
 
 Responses containing `Set-Cookie` are still cached. Live responses deliver those cookies to their caller, while cached copies retain the body and other headers and omit `Set-Cookie`. Cookies already sent with a request remain part of its cache key, so different established sessions use separate entries. Use ordinary live requests for session creation or authentication flows that need fresh cookies or issue session credentials in the response body.
@@ -186,6 +271,8 @@ For stale-while-revalidate policies, the cache store retains each response for `
 
 A refresh replaces only the generation it started with. Removing that cache entry or flushing the store before the refresh's final generation check cancels its write, even when the original lifetime has elapsed. A missing generation is never treated as proof of natural expiry. Deferred callbacks also skip generations that expire before the refresh starts.
 
+Group invalidation cancels pending refreshes and prevents older in-flight reads or refreshes from populating the replacement group generation. An in-flight request still returns its live result to its own caller. Cache failures during invalidation are logged without replacing the mutation's original response.
+
 When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently. Network requests on cache misses aren't locked, so concurrent misses can make separate API calls, as with `Cache::remember()`. A short, nonblocking lock protects cache writes on stores that support locks. A response that completes later keeps its caller's result without replacing a response another caller has already cached.
 
 Warnings include the hashed cache key when available, plus an HTTP status or exception class where relevant. They leave out URLs, credentials, response bodies, and exception messages.
@@ -207,6 +294,8 @@ Add custom Guzzle middleware **before** `remember()` so the cache key includes i
 | Unreadable, non-seekable, or already-consumed request bodies | The body can't be hashed and restored safely. |
 | Custom cURL options, including digest and NTLM authentication | They can change behavior outside the request used for the cache key. |
 | Custom `stream_context` options | They can override headers, bodies, or transport behavior outside the request used for the cache key. |
+
+Grouped mutations retain invalidation even when uploads, custom callbacks, or these other options bypass response caching.
 
 Non-seekable response bodies are also returned without being cached. Use Laravel's normal client stack; a client passed to `setClient()` controls its own middleware.
 
