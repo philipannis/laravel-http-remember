@@ -97,6 +97,29 @@ A fixed lifetime must be a positive integer. A fresh/stale pair must contain exa
 
 The store name comes from your application's `config/cache.php`. Lifetimes and stores you leave out use the package configuration. Calling `remember()` again before sending replaces the previous settings. A reused request builder keeps its options, so start a new `Http` chain for unrelated requests.
 
+### Select responses to cache
+
+Use `cacheWhen` when an API returns HTTP 200 for application errors, such as GraphQL errors, or when other response details determine whether it should be cached. The callback receives an `Illuminate\Http\Client\Response` and must return a boolean. Use its usual `json()`, `body()`, `header()`, and `status()` methods to inspect the API's result:
+
+```php
+use Illuminate\Http\Client\Response;
+
+// Exclude GraphQL errors even when the API returns HTTP 200.
+$products = Http::remember(600, cacheWhen:
+    fn (Response $response): bool => empty($response->json('errors')),
+)->post('https://api.example.com/graphql', [
+    'query' => 'query { products { id name } }',
+])->json();
+```
+
+The predicate runs before storing eligible live responses and deferred refreshes. Cache hits reuse the stored response without invoking the callback. Returning `false` skips storing the live response while preserving its normal result for the caller. A rejected deferred refresh keeps the previous entry until its original expiry.
+
+Predicates receive the live response's original headers and an independent body stream. Reading, closing, or changing that copy does not alter the caller's response or the body stored in the cache. Transfer statistics and cookie jars are not populated on the inspection copy.
+
+Use a predicate that can safely run during live requests and deferred refreshes. Callback exceptions or non-boolean return values reject caching and log the hashed key and exception class; live responses still reach their caller. The callback can only narrow the built-in eligibility rules: non-2xx responses and requests that bypass caching remain outside filtering. Grouped mutations keep their normal invalidation behavior without invoking the predicate.
+
+`cacheWhen` accepts any PHP callable, including closures and invokable objects. Omitting it or passing `null` uses the usual successful-response policy. Calling `remember()` again replaces the predicate along with the other settings. Predicates stay on the request builder and are never serialized into the cache or included in its key. Existing entries keep their original lifetime, so invalidate the relevant group or remove the cached entries when changing a rule that should also apply to previously stored responses.
+
 ### Other HTTP methods
 
 The request body is part of the cache key, so you can also cache a POST used to read data, such as a search:
@@ -177,7 +200,7 @@ $api->put('/products/42', ['name' => 'Updated product']); // Invalidate the grou
 $api->get('/products'); // Fetch and cache the updated list.
 ```
 
-The selected `operation` stays on that builder too. Use `operation: 'read'` on builders dedicated to read operations; leave it unset on builders that mix ordinary reads and writes. Calling `remember()` again replaces the entire policy, including `group` and `operation`.
+The selected `operation` stays on that builder too. Use `operation: 'read'` on builders dedicated to read operations; leave it unset on builders that mix ordinary reads and writes. Calling `remember()` again replaces the entire policy, including `group`, `operation`, and `cacheWhen`.
 
 ### Request behavior
 
@@ -261,6 +284,8 @@ Keep `InvokeDeferredCallbacks` and the normal termination hooks enabled. Long-ru
 | What happens | Result |
 | --- | --- |
 | The API returns a non-2xx response | Return it as usual without caching it. |
+| The response predicate rejects a live response | Return it as usual without caching it. |
+| The response predicate throws or returns a non-boolean value | Skip caching and log the predicate failure. |
 | A live request throws or times out | Keep the usual exception or rejected promise. |
 | A deferred refresh fails | Keep the old entry until its original expiry and log the failure. |
 | A cache read or write fails | Let the live request proceed and log the cache failure. |

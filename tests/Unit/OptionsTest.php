@@ -45,6 +45,7 @@ final class OptionsTest extends TestCase
         self::assertSame(self::FIXED_LIFETIME_SECONDS, $options->lifetime);
         self::assertNull($options->store);
         self::assertNull($options->operation);
+        self::assertNull($options->cacheWhen);
         self::assertSame(self::REFRESH_TIMEOUT_SECONDS, $options->refreshTimeout);
     }
 

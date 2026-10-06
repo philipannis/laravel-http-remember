@@ -2,6 +2,8 @@
 
 namespace PhilipAnnis\HttpRemember;
 
+use Closure;
+use Illuminate\Http\Client\Response;
 use InvalidArgumentException;
 
 /**
@@ -34,6 +36,13 @@ final readonly class HttpRememberOptions
     public ?string $groupHash;
 
     /**
+     * The optional predicate applied before storing live responses or deferred refreshes.
+     *
+     * @var (Closure(Response): bool)|null
+     */
+    public ?Closure $cacheWhen;
+
+    /**
      * Create a fixed-expiry or stale-while-revalidate policy.
      *
      * @param  int|array{int, int}  $ttl  A positive lifetime or [fresh, total lifetime].
@@ -41,6 +50,7 @@ final readonly class HttpRememberOptions
      * @param  int  $refreshTimeout  The maximum deferred network timeout in seconds.
      * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
      * @param  'read'|null  $operation  Read caches any eligible method; null uses automatic detection.
+     * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
      *
      * @throws InvalidArgumentException When a duration, cache store, group, or operation is invalid.
      */
@@ -50,7 +60,11 @@ final readonly class HttpRememberOptions
         public int $refreshTimeout,
         ?array $group = null,
         public ?string $operation = null,
+        ?callable $cacheWhen = null,
     ) {
+        // Keep every supported callable in an immutable closure without rebinding its scope.
+        $this->cacheWhen = $cacheWhen === null ? null : Closure::fromCallable($cacheWhen);
+
         // Require a positive timeout for deferred network work.
         if ($refreshTimeout <= 0) {
             throw new InvalidArgumentException('The HTTP remember refresh timeout must be a positive number of seconds.');

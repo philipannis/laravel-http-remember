@@ -3,6 +3,7 @@
 namespace PhilipAnnis\HttpRemember;
 
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
 use Psr\Http\Message\RequestInterface;
@@ -53,16 +54,23 @@ class HttpRememberServiceProvider extends ServiceProvider
              * @param  int|array{int, int}|null  $ttl  A lifetime, thresholds, or configured default.
              * @param  string|null  $store  A cache store override, or the configured default.
              * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
-             * @param  'read'|null  $operation  Explicit read intent; null is reserved for omission.
+             * @param  'read'|HttpRememberOperation|null  $operation  Explicit read intent; the internal marker identifies omission.
+             * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
              * @return PendingRequest The same request builder for further chaining.
              *
              * @throws InvalidArgumentException When a cache policy is invalid.
              */
-            function (int|array|null $ttl = null, ?string $store = null, ?array $group = null, ?string $operation = null): PendingRequest {
+            function (
+                int|array|null $ttl = null,
+                ?string $store = null,
+                ?array $group = null,
+                string|HttpRememberOperation|null $operation = HttpRememberOperation::Automatic,
+                ?callable $cacheWhen = null,
+            ): PendingRequest {
                 /** @var PendingRequest $this */
 
-                // Distinguish omission from an explicitly supplied null in the final argument.
-                if ($operation === null && func_num_args() >= 4) {
+                // Reject explicit null while allowing later named arguments to omit operation.
+                if ($operation === null) {
                     throw new InvalidArgumentException('The HTTP remember operation must be read when provided.');
                 }
 
@@ -72,7 +80,8 @@ class HttpRememberServiceProvider extends ServiceProvider
                     $store ?? config('http-remember.store'),
                     config('http-remember.refresh_timeout'),
                     $group,
-                    $operation,
+                    $operation === HttpRememberOperation::Automatic ? null : $operation,
+                    $cacheWhen,
                 );
 
                 // Replace an earlier policy instead of nesting multiple cache layers.
