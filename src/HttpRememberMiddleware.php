@@ -9,6 +9,7 @@ use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Response;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -17,6 +18,7 @@ use Psr\Http\Message\ResponseInterface;
 use ReflectionFunction;
 use RuntimeException;
 use Throwable;
+use UnexpectedValueException;
 
 use function Illuminate\Support\defer;
 
@@ -47,7 +49,7 @@ final class HttpRememberMiddleware
     /**
      * Create middleware for one immutable request policy.
      *
-     * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, and operation intent.
+     * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, operation intent, and eligibility predicate.
      * @param  Closure(): bool  $canCache  A guard against later request mutations.
      * @param  Closure(RequestInterface, array<string, mixed>): void  $onHit  Laravel's cache-hit bookkeeping.
      */
@@ -156,9 +158,45 @@ final class HttpRememberMiddleware
                     return Create::promiseFor($response);
                 }
 
-                // Populate an absent or expired entry only after a successful response.
+                // Populate an absent or expired entry only after an eligible response.
                 return $this->sendAndRemember($handler, $request, $options, $cache, $key, null, $group);
             };
+    }
+
+    /**
+     * Apply the response predicate without exposing the caller's body stream to mutation.
+     *
+     * @param  ResponseInterface  $response  The live foreground or deferred refresh response.
+     * @param  HttpRememberResponse  $cached  The captured body used for independent inspection.
+     * @param  string  $key  The hashed response cache key used for safe diagnostics.
+     * @return bool Whether the live response can be stored under the application's cache policy.
+     */
+    private function allowsResponse(ResponseInterface $response, HttpRememberResponse $cached, string $key): bool
+    {
+        // Keep ordinary caching free from additional response inspection when no predicate is supplied.
+        if ($this->settings->cacheWhen === null) {
+            return true;
+        }
+
+        // Contain predicate failures while preserving the caller's live response.
+        try {
+            // Preserve live headers while giving the predicate an independent body stream.
+            $copy = $response->withBody(Utils::streamFor($cached->toArray()['body']));
+            $eligible = ($this->settings->cacheWhen)(new Response($copy));
+
+            // Require an explicit boolean instead of interpreting accidental truthy return values.
+            if (! is_bool($eligible)) {
+                throw new UnexpectedValueException('The HTTP remember response eligibility callback must return a boolean.');
+            }
+
+            // Let the application narrow the responses accepted by the built-in caching rules.
+            return $eligible;
+        } catch (Throwable $exception) {
+            // Reject caching while preserving the live response and omitting sensitive exception details.
+            $this->logFailure('eligibility', $key, ['exception' => $exception::class]);
+
+            return false;
+        }
     }
 
     /**
@@ -337,8 +375,8 @@ final class HttpRememberMiddleware
                     // Buffer first so a slow stream cannot invalidate the generation check.
                     $cached = HttpRememberResponse::capture($response);
 
-                    // Persist only serializable successful responses.
-                    if ($cached === null) {
+                    // Persist only serializable successful responses accepted by the active predicate.
+                    if ($cached === null || ! $this->allowsResponse($response, $cached, $key)) {
                         return $response;
                     }
 
