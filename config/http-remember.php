@@ -5,7 +5,7 @@
  * Choose a fixed lifetime or [fresh, total lifetime] thresholds.
  * All durations are measured in seconds.
  *
- * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int}
+ * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, ignored_headers: list<string>}
  */
 return [
 
@@ -17,5 +17,18 @@ return [
 
     // Limit deferred refreshes to 15 seconds; preserve shorter request timeouts.
     'refresh_timeout' => 15,
+
+    // Ignore common tracing and correlation headers when generating cache keys.
+    'ignored_headers' => [
+        'traceparent',
+        'tracestate',
+        'request-id',
+        'x-request-id',
+        'x-correlation-id',
+        'client-request-id',
+        'x-ms-client-request-id',
+        'x-cloud-trace-context',
+        'x-amzn-trace-id',
+    ],
 
 ];
