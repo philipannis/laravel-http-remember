@@ -240,12 +240,26 @@ return [
 
     // Limit network timeouts during deferred refreshes to 15 seconds.
     'refresh_timeout' => 15,
+
+    // Exclude common tracing and correlation headers from cache keys.
+    'ignored_headers' => [
+        'traceparent',
+        'tracestate',
+        'request-id',
+        'x-request-id',
+        'x-correlation-id',
+        'client-request-id',
+        'x-ms-client-request-id',
+        'x-cloud-trace-context',
+        'x-amzn-trace-id',
+    ],
 ];
 ```
 
 - `ttl` accepts the same values as `remember()`: use `3600` for a fixed hour, or `[1800, 3600]` for the default fresh/stale behavior.
 - `store` is a configured cache store name. Leave it `null` to use your application's default, or set it to `'redis'` to use Redis.
 - `refresh_timeout` must be a positive integer. It caps network timeouts for deferred refreshes only. Shorter timeouts stay unchanged; unlimited or longer timeouts use this cap. It doesn't change timeouts for requests that callers wait for.
+- `ignored_headers` is a list of request header names excluded from cache keys. The defaults cover common tracing and correlation headers, so changing a request ID does not create another cache entry. Names match case-insensitively; use lowercase names in configuration. Replace the list to customize it, or set it to `[]` to include all request headers. Headers are still sent upstream normally.
 
 Calling `remember()` without arguments uses these defaults. Passing a lifetime or store overrides that setting for one request.
 
@@ -261,11 +275,13 @@ Skip this step if you don't cache configuration.
 
 ## Cache keys and responses
 
-Keys use the `http-remember:` prefix followed by a SHA-256 hash of the method, URL (including its query string but excluding its fragment), headers, body, protocol, relevant authentication and transport options, and cache lifetime settings.
+Keys use the `http-remember:` prefix followed by a SHA-256 hash of the method, URL (including its query string but excluding its fragment), headers other than the configured `ignored_headers`, body, protocol, relevant authentication and transport options, and cache lifetime settings.
 
-Header names and their ordering are normalized. Header values, body bytes, and query ordering stay as sent. Different bearer tokens, basic credentials, cookie headers, bodies, or lifetimes get separate entries. URLs and credentials aren't written into keys as plaintext.
+Header names and their ordering are normalized. Included header values, body bytes, and query ordering stay as sent. The default exclusions preserve separate entries for different bearer tokens, basic credentials, cookie headers, bodies, or lifetimes. URLs and credentials aren't written into keys as plaintext.
 
-Grouped keys also include the SHA-256 hash of the sorted group array and its current generation. Group values are not written into keys as plaintext. Requests without a group retain their original cache identity; `operation` does not change the identity of a cacheable response.
+Only exclude headers that do not affect the response data. Authentication, tenant, language, API-version, and idempotency headers remain in the key by default. Responses with `Vary: *` or a `Vary` field naming an ignored header are returned live without being cached or reused, because their variants cannot be distinguished by the filtered key. Other `Vary` headers remain cacheable because their request headers are still included.
+
+Grouped keys also include the SHA-256 hash of the sorted group array and its current generation. Group values are not written into keys as plaintext. Requests without a group use the same filtered request fingerprint without group fields; `operation` does not change the identity of a cacheable response.
 
 Invalidation replaces one shared generation record instead of scanning response keys, so groups work without cache tags or atomic locks. Old responses become unreachable and expire at their existing backend lifetimes. The store retains one small generation record per group until it is replaced or removed. Missing metadata creates a fresh generation and never restores older cached responses.
 

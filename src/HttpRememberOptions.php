@@ -43,6 +43,13 @@ final readonly class HttpRememberOptions
     public ?Closure $cacheWhen;
 
     /**
+     * The lowercase request header names excluded from cache fingerprints.
+     *
+     * @var list<string>
+     */
+    public array $ignoredHeaders;
+
+    /**
      * Create a fixed-expiry or stale-while-revalidate policy.
      *
      * @param  int|array{int, int}  $ttl  A positive lifetime or [fresh, total lifetime].
@@ -51,8 +58,9 @@ final readonly class HttpRememberOptions
      * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
      * @param  'read'|null  $operation  Read caches any eligible method; null uses automatic detection.
      * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
+     * @param  list<string>  $ignoredHeaders  Request header names excluded from cache fingerprints.
      *
-     * @throws InvalidArgumentException When a duration, cache store, group, or operation is invalid.
+     * @throws InvalidArgumentException When a duration, cache store, group, operation, or header name is invalid.
      */
     public function __construct(
         int|array $ttl,
@@ -61,6 +69,7 @@ final readonly class HttpRememberOptions
         ?array $group = null,
         public ?string $operation = null,
         ?callable $cacheWhen = null,
+        array $ignoredHeaders = [],
     ) {
         // Keep every supported callable in an immutable closure without rebinding its scope.
         $this->cacheWhen = $cacheWhen === null ? null : Closure::fromCallable($cacheWhen);
@@ -74,6 +83,21 @@ final readonly class HttpRememberOptions
         if ($store !== null && trim($store) === '') {
             throw new InvalidArgumentException('The HTTP remember cache store must be a non-empty name or null.');
         }
+
+        // Reject malformed configuration before it can change a request's cache identity.
+        if (! array_is_list($ignoredHeaders)) {
+            throw new InvalidArgumentException('The HTTP remember ignored headers must be a list of valid header names.');
+        }
+
+        // Require HTTP field-name tokens instead of silently accepting names that cannot match.
+        foreach ($ignoredHeaders as $header) {
+            if (! is_string($header) || preg_match("/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/D", $header) !== 1) {
+                throw new InvalidArgumentException('The HTTP remember ignored headers must be a list of valid header names.');
+            }
+        }
+
+        // Match field names case-insensitively without repeatedly normalizing configuration.
+        $this->ignoredHeaders = array_values(array_unique(array_map(strtolower(...), $ignoredHeaders)));
 
         // Reserve null for automatic detection and accept only explicit read intent.
         if ($operation !== null && $operation !== 'read') {
