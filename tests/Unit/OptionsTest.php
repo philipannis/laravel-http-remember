@@ -149,6 +149,69 @@ final class OptionsTest extends TestCase
     }
 
     /**
+     * Confirm ignored names are normalized once without changing the caller's array.
+     */
+    public function test_ignored_header_names_are_normalized(): void
+    {
+        // Supply repeated names with different casing without modifying the caller's values.
+        $headers = ['X-Request-ID', 'TRACEPARENT', 'x-request-id'];
+        $options = new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            ignoredHeaders: $headers,
+        );
+
+        // Retain one lowercase exclusion for each distinct header name.
+        self::assertSame(['x-request-id', 'traceparent'], $options->ignoredHeaders);
+        self::assertSame(['X-Request-ID', 'TRACEPARENT', 'x-request-id'], $headers);
+
+        // Leave exclusions empty when an internal policy does not supply them.
+        $default = new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, null, self::REFRESH_TIMEOUT_SECONDS);
+        self::assertSame([], $default->ignoredHeaders);
+    }
+
+    /**
+     * Confirm malformed exclusion lists fail during policy construction.
+     *
+     * @param  array<mixed>  $headers  The invalid header exclusion list.
+     */
+    #[DataProvider('invalidIgnoredHeaders')]
+    public function test_invalid_ignored_headers_are_rejected(array $headers): void
+    {
+        // Reject invalid field names before middleware can fingerprint a request.
+        $this->expectException(InvalidArgumentException::class);
+
+        // Attempt to configure unsupported names using an otherwise valid policy.
+        new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            ignoredHeaders: $headers,
+        );
+    }
+
+    /**
+     * Provide exclusion lists with unsupported keys, names, or value types.
+     *
+     * @return iterable<string, array{array<mixed>}> Invalid exclusion lists keyed by purpose.
+     */
+    public static function invalidIgnoredHeaders(): iterable
+    {
+        // Require a positional list containing only HTTP field-name tokens.
+        yield 'associative array' => [['header' => 'x-request-id']];
+        yield 'empty name' => [['']];
+        yield 'padded name' => [[' x-request-id ']];
+        yield 'whitespace inside a name' => [['x request id']];
+        yield 'colon inside a name' => [['x-request-id:']];
+
+        // Reject values that cannot identify request headers.
+        yield 'integer name' => [[42]];
+        yield 'null name' => [[null]];
+        yield 'nested array' => [[['x-request-id']]];
+    }
+
+    /**
      * Confirm unsupported operation values cannot create a request policy.
      *
      * @param  mixed  $operation  The unsupported operation value.

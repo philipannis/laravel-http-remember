@@ -49,7 +49,7 @@ final class HttpRememberMiddleware
     /**
      * Create middleware for one immutable request policy.
      *
-     * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, operation intent, and eligibility predicate.
+     * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, operation intent, eligibility predicate, and ignored headers.
      * @param  Closure(): bool  $canCache  A guard against later request mutations.
      * @param  Closure(RequestInterface, array<string, mixed>): void  $onHit  Laravel's cache-hit bookkeeping.
      */
@@ -127,7 +127,13 @@ final class HttpRememberMiddleware
                     if ($cached !== null
                         && ! $cached->hasReached($this->settings->lifetime)
                         && ($group === null || $group->isCurrent())) {
-                        $response = $cached->toResponse();
+                        // Reconstruct the response before inspecting its declared header dependencies.
+                        $candidate = $cached->toResponse();
+
+                        // Recheck entries stored before the ignored-header configuration changed.
+                        if (! $this->variesOnIgnoredHeaders($candidate)) {
+                            $response = $candidate;
+                        }
                     }
                 } catch (Throwable $exception) {
                     // Report the cache failure without exposing the exception message.
@@ -300,8 +306,11 @@ final class HttpRememberMiddleware
      */
     private function cacheKey(RequestInterface $request, array $options, ?HttpRememberGroup $group): string
     {
-        // Normalize header names and ordering while preserving all header values.
-        $headers = array_change_key_case($request->getHeaders(), CASE_LOWER);
+        // Normalize names and omit configured headers without changing the outgoing request.
+        $headers = array_diff_key(
+            array_change_key_case($request->getHeaders(), CASE_LOWER),
+            array_flip($this->settings->ignoredHeaders),
+        );
         ksort($headers);
 
         // Restore the request stream even when hashing an unusual stream fails.
@@ -341,6 +350,31 @@ final class HttpRememberMiddleware
     }
 
     /**
+     * Reject responses whose declared variants cannot be represented by the filtered key.
+     *
+     * @param  ResponseInterface  $response  The live or remembered upstream response.
+     * @return bool Whether vary requires an excluded header or unrestricted variation.
+     */
+    private function variesOnIgnoredHeaders(ResponseInterface $response): bool
+    {
+        // Handle multiple vary fields and comma-separated, case-insensitive names.
+        foreach ($response->getHeader('Vary') as $line) {
+            foreach (explode(',', $line) as $header) {
+                // Normalize each field independently of its casing and surrounding whitespace.
+                $header = strtolower(trim($header));
+
+                // Reject variants that the remembered request fingerprint cannot distinguish.
+                if ($header === '*' || in_array($header, $this->settings->ignoredHeaders, true)) {
+                    return true;
+                }
+            }
+        }
+
+        // Keep caching available when every declared field remains part of the fingerprint.
+        return false;
+    }
+
+    /**
      * Send a live request and store its response only when it succeeds.
      *
      * @param  Handler  $handler  The next handler in the outgoing request stack.
@@ -372,6 +406,11 @@ final class HttpRememberMiddleware
             function (ResponseInterface $response) use ($cache, $key, $generation, $group): ResponseInterface {
                 // Keep response capture and cache persistence optional for the caller.
                 try {
+                    // Preserve declared response variants that the filtered key cannot distinguish.
+                    if ($this->variesOnIgnoredHeaders($response)) {
+                        return $response;
+                    }
+
                     // Buffer first so a slow stream cannot invalidate the generation check.
                     $cached = HttpRememberResponse::capture($response);
 

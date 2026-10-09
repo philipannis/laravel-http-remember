@@ -82,6 +82,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                     $group,
                     $operation === HttpRememberOperation::Automatic ? null : $operation,
                     $cacheWhen,
+                    config('http-remember.ignored_headers'),
                 );
 
                 // Replace an earlier policy instead of nesting multiple cache layers.
