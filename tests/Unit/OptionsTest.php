@@ -47,6 +47,7 @@ final class OptionsTest extends TestCase
         self::assertNull($options->operation);
         self::assertNull($options->cacheWhen);
         self::assertSame(self::REFRESH_TIMEOUT_SECONDS, $options->refreshTimeout);
+        self::assertSame(1_000_000, $options->maxResponseBytes);
     }
 
     /**
@@ -134,6 +135,55 @@ final class OptionsTest extends TestCase
 
         // Attempt to create a policy with no usable refresh timeout.
         new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, null, 0);
+    }
+
+    /**
+     * Confirm a custom response size remains available to the cache middleware.
+     */
+    public function test_response_size_limit_can_be_configured(): void
+    {
+        // Set an explicit byte budget without changing the request's lifetime policy.
+        $options = new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            maxResponseBytes: 16,
+        );
+
+        // Retain the configured limit in bytes rather than converting it to another unit.
+        self::assertSame(16, $options->maxResponseBytes);
+    }
+
+    /**
+     * Confirm zero and negative response budgets fail before middleware is attached.
+     *
+     * @param  int  $maxResponseBytes  The invalid response size in bytes.
+     */
+    #[DataProvider('invalidResponseSizes')]
+    public function test_invalid_response_size_is_rejected(int $maxResponseBytes): void
+    {
+        // Require a positive budget instead of interpreting a non-positive value as unlimited.
+        $this->expectException(InvalidArgumentException::class);
+
+        // Attempt to construct an otherwise valid policy with an unusable size limit.
+        new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            maxResponseBytes: $maxResponseBytes,
+        );
+    }
+
+    /**
+     * Provide response budgets that cannot bound cached body sizes.
+     *
+     * @return iterable<string, array{int}> Invalid sizes keyed by purpose.
+     */
+    public static function invalidResponseSizes(): iterable
+    {
+        // Reject both an empty budget and the common unlimited sentinel.
+        yield 'zero bytes' => [0];
+        yield 'negative bytes' => [-1];
     }
 
     /**

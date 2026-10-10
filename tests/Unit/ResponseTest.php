@@ -2,14 +2,17 @@
 
 namespace PhilipAnnis\HttpRemember\Tests\Unit;
 
+use GuzzleHttp\Psr7\FnStream;
 use GuzzleHttp\Psr7\NoSeekStream;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Carbon;
+use PhilipAnnis\HttpRemember\HttpRememberOptions;
 use PhilipAnnis\HttpRemember\HttpRememberResponse;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 
 /**
  * Verify the serializable representation of remembered responses.
@@ -25,6 +28,11 @@ final class ResponseTest extends TestCase
      * The age threshold used by expiration assertions.
      */
     private const AGE_THRESHOLD_SECONDS = 60;
+
+    /**
+     * The small byte budget used to exercise response capture boundaries.
+     */
+    private const MAX_RESPONSE_BYTES = 16;
 
     /**
      * Restore the global clock after every response test.
@@ -153,6 +161,214 @@ final class ResponseTest extends TestCase
         // Confirm neither response can enter the cache store.
         self::assertNull(HttpRememberResponse::capture($failed));
         self::assertNull(HttpRememberResponse::capture($nonSeekable));
+    }
+
+    /**
+     * Confirm known oversized bodies are skipped without reading or moving their streams.
+     */
+    public function test_known_oversized_responses_are_not_read(): void
+    {
+        // Keep the caller's cursor partway through a body whose size exceeds the budget.
+        $body = Utils::streamFor(str_repeat('x', self::MAX_RESPONSE_BYTES + 1));
+        $body->seek(4);
+        $stream = FnStream::decorate($body, [
+            'read' =>
+                /**
+                 * Fail if capture buffers a body that can be rejected from its known size.
+                 */
+                static fn (int $length): string => throw new RuntimeException('An oversized body was read.'),
+        ]);
+
+        // Return no cache candidate while preserving the live body and its original cursor.
+        self::assertNull(HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $stream), self::MAX_RESPONSE_BYTES));
+        self::assertSame(4, $stream->tell());
+        self::assertSame(str_repeat('x', self::MAX_RESPONSE_BYTES + 1), (string) $stream);
+    }
+
+    /**
+     * Confirm actual bytes enforce the limit even when size metadata is unavailable or inaccurate.
+     *
+     * @param  int  $bodyBytes  The complete live body size in bytes.
+     * @param  int|null  $reportedSize  The size advertised by the stream.
+     */
+    #[DataProvider('responseSizeBoundaries')]
+    public function test_capture_bounds_reads_and_preserves_the_live_body(int $bodyBytes, ?int $reportedSize): void
+    {
+        // Advertise a misleading Content-Length independently of the stream's actual bytes.
+        $contents = str_repeat('x', $bodyBytes);
+        $body = Utils::streamFor($contents);
+        $position = min(4, $bodyBytes);
+        $body->seek($position);
+        $readBytes = 0;
+        $stream = FnStream::decorate($body, [
+            'getSize' =>
+                /**
+                 * Hide or underreport the body's size so capture must enforce its own budget.
+                 */
+                static fn (): ?int => $reportedSize,
+            'read' =>
+                /**
+                 * Count actual bytes consumed by bounded capture and its overflow probe.
+                 */
+                static function (int $length) use ($body, &$readBytes): string {
+                    $chunk = $body->read($length);
+                    $readBytes += strlen($chunk);
+
+                    return $chunk;
+                },
+            'getContents' =>
+                /**
+                 * Reject unbounded reads even when the declared size is small.
+                 */
+                static fn (): string => throw new RuntimeException('An unbounded body read was attempted.'),
+        ]);
+        $response = new Response(HttpStatus::HTTP_OK, ['Content-Length' => '1'], $stream);
+
+        // Capture only complete bodies that fit, including bodies exactly at the limit.
+        $captured = HttpRememberResponse::capture($response, self::MAX_RESPONSE_BYTES);
+        if ($bodyBytes <= self::MAX_RESPONSE_BYTES) {
+            self::assertNotNull($captured);
+            self::assertSame($contents, $captured->toArray()['body']);
+        } else {
+            self::assertNull($captured);
+        }
+
+        // Read no more than the budget and one probe byte, then restore the caller's stream.
+        self::assertSame(min($bodyBytes, self::MAX_RESPONSE_BYTES + 1), $readBytes);
+        self::assertSame($position, $stream->tell());
+        self::assertSame($contents, (string) $stream);
+    }
+
+    /**
+     * Provide body sizes around the limit with unknown or underestimated stream metadata.
+     *
+     * @return iterable<string, array{int, int|null}> Capture boundaries keyed by size and metadata.
+     */
+    public static function responseSizeBoundaries(): iterable
+    {
+        // Check empty bodies, inclusive boundaries, and bodies substantially above the budget.
+        yield 'empty unknown body' => [0, null];
+        yield 'small unknown body' => [self::MAX_RESPONSE_BYTES - 1, null];
+        yield 'exact unknown body' => [self::MAX_RESPONSE_BYTES, null];
+        yield 'oversized unknown body' => [self::MAX_RESPONSE_BYTES + 1, null];
+        yield 'large unknown body' => [4096, null];
+        yield 'underreported exact body' => [self::MAX_RESPONSE_BYTES, 1];
+        yield 'underreported oversized body' => [4096, 1];
+    }
+
+    /**
+     * Confirm capture assembles complete bodies when individual reads return fewer bytes.
+     */
+    public function test_capture_handles_short_reads_at_the_size_limit(): void
+    {
+        // Return a few bytes per read while advertising no total size.
+        $contents = str_repeat('x', self::MAX_RESPONSE_BYTES);
+        $body = Utils::streamFor($contents);
+        $body->seek(4);
+        $stream = FnStream::decorate($body, [
+            'getSize' => static fn (): ?int => null,
+            'read' => static fn (int $length): string => $body->read(min(3, $length)),
+        ]);
+
+        // Preserve the complete payload and the caller's cursor despite repeated short reads.
+        $captured = HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $stream), self::MAX_RESPONSE_BYTES);
+        self::assertNotNull($captured);
+        self::assertSame($contents, $captured->toArray()['body']);
+        self::assertSame(4, $stream->tell());
+    }
+
+    /**
+     * Confirm a large configured budget never requires allocating that entire budget for a small body.
+     */
+    public function test_capture_reads_small_bodies_in_chunks_with_large_budgets(): void
+    {
+        // Hide the size while allowing the largest positive integer as the capture budget.
+        $body = Utils::streamFor('response-body');
+        $stream = FnStream::decorate($body, [
+            'getSize' => static fn (): ?int => null,
+            'read' =>
+                /**
+                 * Reject requests large enough to allocate the whole configured budget at once.
+                 */
+                static function (int $length) use ($body): string {
+                    self::assertLessThanOrEqual(1024 * 1024, $length);
+
+                    return $body->read($length);
+                },
+        ]);
+
+        // Capture the complete small response without overflowing the extra-byte probe budget.
+        $captured = HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $stream), PHP_INT_MAX);
+        self::assertNotNull($captured);
+        self::assertSame('response-body', $captured->toArray()['body']);
+        self::assertSame(0, $stream->tell());
+    }
+
+    /**
+     * Confirm a stream that stops yielding bytes before EOF is never cached as a truncated body.
+     */
+    public function test_incomplete_response_streams_are_not_captured(): void
+    {
+        // Simulate a readable stream that cannot finish without advancing the caller's cursor.
+        $body = Utils::streamFor('response-body');
+        $body->seek(4);
+        $stream = FnStream::decorate($body, [
+            'getSize' => static fn (): ?int => null,
+            'read' => static fn (int $length): string => '',
+            'eof' => static fn (): bool => false,
+        ]);
+
+        // Refuse the incomplete candidate and restore the original stream position.
+        self::assertNull(HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $stream), self::MAX_RESPONSE_BYTES));
+        self::assertSame(4, $stream->tell());
+    }
+
+    /**
+     * Confirm bounded capture restores the caller's cursor when reading fails partway through.
+     */
+    public function test_capture_restores_the_stream_after_read_failures(): void
+    {
+        // Consume bytes before failing so the finally block must restore a changed cursor.
+        $body = Utils::streamFor('response-body');
+        $body->seek(4);
+        $stream = FnStream::decorate($body, [
+            'read' =>
+                /**
+                 * Fail after advancing the stream during response capture.
+                 */
+                static function (int $length) use ($body): string {
+                    $body->read(2);
+
+                    throw new RuntimeException('The bounded read failed.');
+                },
+        ]);
+        $this->expectException(RuntimeException::class);
+
+        // Leave the original body usable even when capture cannot produce a cache candidate.
+        try {
+            HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $stream), self::MAX_RESPONSE_BYTES);
+        } finally {
+            self::assertSame(4, $stream->tell());
+        }
+    }
+
+    /**
+     * Confirm restoring an existing entry preserves bodies written under a larger size budget.
+     */
+    public function test_restore_preserves_bodies_written_under_a_larger_size_budget(): void
+    {
+        // Capture a body at the original limit before an application lowers its budget.
+        $limit = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES + 1;
+        $contents = str_repeat('x', $limit);
+        $captured = HttpRememberResponse::capture(new Response(HttpStatus::HTTP_OK, [], $contents), $limit);
+        self::assertNotNull($captured);
+        $payload = $captured->toArray();
+
+        // Restore the complete stored body without applying the default capture budget again.
+        $restored = HttpRememberResponse::restore($payload);
+        self::assertNotNull($restored);
+        self::assertSame($contents, $restored->toResponse()->getBody()->getContents());
+        self::assertSame($contents, $payload['body']);
     }
 
     /**

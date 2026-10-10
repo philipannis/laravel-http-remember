@@ -83,6 +83,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                     $operation === HttpRememberOperation::Automatic ? null : $operation,
                     $cacheWhen,
                     config('http-remember.ignored_headers'),
+                    config('http-remember.max_response_bytes'),
                 );
 
                 // Replace an earlier policy instead of nesting multiple cache layers.

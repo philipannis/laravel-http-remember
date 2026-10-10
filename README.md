@@ -241,6 +241,9 @@ return [
     // Limit network timeouts during deferred refreshes to 15 seconds.
     'refresh_timeout' => 15,
 
+    // Cache response bodies up to 1 MB.
+    'max_response_bytes' => 1_000_000,
+
     // Exclude common tracing and correlation headers from cache keys.
     'ignored_headers' => [
         'traceparent',
@@ -259,6 +262,7 @@ return [
 - `ttl` accepts the same values as `remember()`: use `3600` for a fixed hour, or `[1800, 3600]` for the default fresh/stale behavior.
 - `store` is a configured cache store name. Leave it `null` to use your application's default, or set it to `'redis'` to use Redis.
 - `refresh_timeout` must be a positive integer. It caps network timeouts for deferred refreshes only. Shorter timeouts stay unchanged; unlimited or longer timeouts use this cap. It doesn't change timeouts for requests that callers wait for.
+- `max_response_bytes` must be a positive integer and defaults to **1 MB**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible; larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
 - `ignored_headers` is a list of request header names excluded from cache keys. The defaults cover common tracing and correlation headers, so changing a request ID does not create another cache entry. Names match case-insensitively; use lowercase names in configuration. Replace the list to customize it, or set it to `[]` to include all request headers. Headers are still sent upstream normally.
 
 Calling `remember()` without arguments uses these defaults. Passing a lifetime or store overrides that setting for one request.
@@ -340,7 +344,9 @@ Grouped mutations retain invalidation even when uploads, custom callbacks, or th
 
 Non-seekable response bodies are also returned without being cached. Use Laravel's normal client stack; a client passed to `setClient()` controls its own middleware.
 
-Response bodies are buffered in memory when cached, so keep this for API responses of a manageable size rather than large file transfers. Guzzle handles redirects, and a redirecting URL may still make the initial redirect request. Use the API's final URL to avoid that extra call.
+Response capture reads at most `max_response_bytes` plus one byte and restores the live stream's original position. Known oversized streams are skipped without reading them, and missing or inaccurate `Content-Length` headers cannot bypass the limit. An oversized deferred refresh keeps the previous generation until its original expiry.
+
+The default 1 MB limit keeps cache buffering small and predictable across web requests, commands, and queue workers. Set `max_response_bytes` for your expected API payloads and cache backend's item limits; the serialized cache entry is larger than its body. This bounds the package's cache copy; Guzzle still downloads the full response, and application code can still read it normally. Use streaming or `sink()` for large transfers.
 
 ## License
 

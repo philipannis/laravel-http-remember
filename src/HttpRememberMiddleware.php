@@ -412,7 +412,7 @@ final class HttpRememberMiddleware
                     }
 
                     // Buffer first so a slow stream cannot invalidate the generation check.
-                    $cached = HttpRememberResponse::capture($response);
+                    $cached = HttpRememberResponse::capture($response, $this->settings->maxResponseBytes);
 
                     // Persist only serializable successful responses accepted by the active predicate.
                     if ($cached === null || ! $this->allowsResponse($response, $cached, $key)) {
