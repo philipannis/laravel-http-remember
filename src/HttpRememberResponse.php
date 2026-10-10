@@ -33,25 +33,39 @@ final class HttpRememberResponse
      *
      * @param  ResponseInterface  $response  The response returned by the next handler.
      * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
+     * @param  string|null  $reason  The reason capture was skipped, when requested.
      * @return self|null The captured response, or null when it cannot be cached.
      *
      * @throws RuntimeException When the response stream cannot be read or restored.
      */
-    public static function capture(ResponseInterface $response, int $maxResponseBytes = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES): ?self
+    public static function capture(ResponseInterface $response, int $maxResponseBytes = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES, ?string &$reason = null): ?self
     {
+        // Reset diagnostics before checking this response's status and stream.
+        $reason = null;
+
         // Inspect the response without consuming its body.
         $status = $response->getStatusCode();
         $stream = $response->getBody();
 
         // Cache only successful responses whose body can be read and restored.
-        if ($status < HttpStatus::HTTP_OK || $status >= HttpStatus::HTTP_MULTIPLE_CHOICES
-            || ! $stream->isSeekable() || ! $stream->isReadable()) {
+        if ($status < HttpStatus::HTTP_OK || $status >= HttpStatus::HTTP_MULTIPLE_CHOICES) {
+            $reason = 'response_status';
+
+            return null;
+        }
+
+        // Preserve unsuitable response streams without consuming their contents.
+        if (! $stream->isSeekable() || ! $stream->isReadable()) {
+            $reason = 'response_stream';
+
             return null;
         }
 
         // Skip known oversized bodies before allocating a cache copy.
         $size = $stream->getSize();
         if ($size !== null && $size > $maxResponseBytes) {
+            $reason = 'response_size';
+
             return null;
         }
 
@@ -66,6 +80,8 @@ final class HttpRememberResponse
 
             // Probe one extra byte without caching truncated bodies or streams that cannot finish reading.
             if (! $stream->eof() && ($stream->read(1) !== '' || ! $stream->eof())) {
+                $reason = 'response_size';
+
                 return null;
             }
         } finally {
@@ -132,6 +148,17 @@ final class HttpRememberResponse
     {
         // Compare ages without extending the entry's lifetime on cache hits.
         return Carbon::now()->getPreciseTimestamp() / 1000000 >= $this->data['stored_at'] + $seconds;
+    }
+
+    /**
+     * Retrieve the cached response's age without extending its lifetime.
+     *
+     * @return float The non-negative age in seconds, including fractional seconds.
+     */
+    public function age(): float
+    {
+        // Keep clock adjustments from exposing negative response ages in event logs.
+        return max(0.0, Carbon::now()->getPreciseTimestamp() / 1000000 - $this->data['stored_at']);
     }
 
     /**

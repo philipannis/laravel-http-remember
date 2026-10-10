@@ -67,6 +67,9 @@ abstract class TestCase extends Orchestra
         $app['config']->set('http-remember.ttl', [self::DEFAULT_FRESH_SECONDS, self::DEFAULT_LIFETIME_SECONDS]);
         $app['config']->set('http-remember.store', null);
         $app['config']->set('http-remember.refresh_timeout', self::DEFAULT_REFRESH_TIMEOUT_SECONDS);
+
+        // Keep routine event logs in memory unless a test explicitly exercises a log channel.
+        $app['config']->set('http-remember.event_logs.enabled', false);
     }
 
     /**
