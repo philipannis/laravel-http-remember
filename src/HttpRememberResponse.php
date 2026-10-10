@@ -2,7 +2,9 @@
 
 namespace PhilipAnnis\HttpRemember;
 
+use GuzzleHttp\Psr7\LimitStream;
 use GuzzleHttp\Psr7\Response;
+use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
@@ -27,14 +29,15 @@ final class HttpRememberResponse
     private function __construct(private readonly array $data) {}
 
     /**
-     * Capture a successful, seekable response without changing its stream position.
+     * Capture a successful response within its size budget without changing its stream position.
      *
      * @param  ResponseInterface  $response  The response returned by the next handler.
+     * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
      * @return self|null The captured response, or null when it cannot be cached.
      *
      * @throws RuntimeException When the response stream cannot be read or restored.
      */
-    public static function capture(ResponseInterface $response): ?self
+    public static function capture(ResponseInterface $response, int $maxResponseBytes = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES): ?self
     {
         // Inspect the response without consuming its body.
         $status = $response->getStatusCode();
@@ -46,14 +49,25 @@ final class HttpRememberResponse
             return null;
         }
 
+        // Skip known oversized bodies before allocating a cache copy.
+        $size = $stream->getSize();
+        if ($size !== null && $size > $maxResponseBytes) {
+            return null;
+        }
+
         // Remember the live response's cursor before reading its complete body.
         $position = $stream->tell();
 
         // Restore the cursor even when reading the response body fails.
         try {
-            // Read the complete response body for serialization.
+            // Bound capture even when the stream size or Content-Length is unavailable or inaccurate.
             $stream->rewind();
-            $body = $stream->getContents();
+            $body = Utils::copyToString(new LimitStream($stream, $maxResponseBytes));
+
+            // Probe one extra byte without caching truncated bodies or streams that cannot finish reading.
+            if (! $stream->eof() && ($stream->read(1) !== '' || ! $stream->eof())) {
+                return null;
+            }
         } finally {
             // Leave the live response at the caller's original stream position.
             $stream->seek($position);

@@ -14,6 +14,11 @@ use InvalidArgumentException;
 final readonly class HttpRememberOptions
 {
     /**
+     * The default maximum cached response body size in bytes.
+     */
+    public const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
+
+    /**
      * The age at which a cached response becomes stale.
      */
     public int $fresh;
@@ -59,8 +64,9 @@ final readonly class HttpRememberOptions
      * @param  'read'|null  $operation  Read caches any eligible method; null uses automatic detection.
      * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
      * @param  list<string>  $ignoredHeaders  Request header names excluded from cache fingerprints.
+     * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
      *
-     * @throws InvalidArgumentException When a duration, cache store, group, operation, or header name is invalid.
+     * @throws InvalidArgumentException When a duration, cache store, group, operation, header name, or response size is invalid.
      */
     public function __construct(
         int|array $ttl,
@@ -70,6 +76,7 @@ final readonly class HttpRememberOptions
         public ?string $operation = null,
         ?callable $cacheWhen = null,
         array $ignoredHeaders = [],
+        public int $maxResponseBytes = self::DEFAULT_MAX_RESPONSE_BYTES,
     ) {
         // Keep every supported callable in an immutable closure without rebinding its scope.
         $this->cacheWhen = $cacheWhen === null ? null : Closure::fromCallable($cacheWhen);
@@ -77,6 +84,11 @@ final readonly class HttpRememberOptions
         // Require a positive timeout for deferred network work.
         if ($refreshTimeout <= 0) {
             throw new InvalidArgumentException('The HTTP remember refresh timeout must be a positive number of seconds.');
+        }
+
+        // Require a bounded response budget instead of silently allowing unlimited buffering.
+        if ($maxResponseBytes <= 0) {
+            throw new InvalidArgumentException('The HTTP remember maximum response size must be a positive number of bytes.');
         }
 
         // Reject empty store names so configuration mistakes remain visible.

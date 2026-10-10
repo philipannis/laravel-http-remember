@@ -446,13 +446,14 @@ final class CacheLifecycleTest extends TestCase
 
         // Replace the stale entry while the deferred response body is being read.
         $refreshBody = FnStream::decorate($body, [
-            'getContents' =>
+            'read' =>
                 /**
                  * Simulate another worker storing a newer response during buffering.
                  *
+                 * @param  int  $length  The maximum bytes requested by bounded response capture.
                  * @return string The older deferred response body.
                  */
-                static function () use ($cache, $body, $startedAt, $replacedAfterSeconds): string {
+                static function (int $length) use ($cache, $body, $startedAt, $replacedAfterSeconds): string {
                     // Write a new generation under the original request's cache key.
                     $key = array_key_first($cache->getStore()->all());
                     Carbon::setTestNow($startedAt->copy()->addSeconds($replacedAfterSeconds));
@@ -464,7 +465,7 @@ final class CacheLifecycleTest extends TestCase
                     $cache->put($key, $replacement->toArray(), self::LIFETIME_SECONDS);
 
                     // Let capture finish with the older refresh payload.
-                    return $body->getContents();
+                    return $body->read($length);
                 },
         ]);
 
@@ -515,13 +516,14 @@ final class CacheLifecycleTest extends TestCase
 
         // Remove the entry while its refresh response is being buffered.
         $refreshBody = FnStream::decorate($body, [
-            'getContents' =>
+            'read' =>
                 /**
                  * Remove the original generation before completing the deferred transfer.
                  *
+                 * @param  int  $length  The maximum bytes requested by bounded response capture.
                  * @return string The successful deferred response body.
                  */
-                static function () use ($cache, $body, $startedAt, $invalidatedAfterSeconds, $completedAfterSeconds, $flush): string {
+                static function (int $length) use ($cache, $body, $startedAt, $invalidatedAfterSeconds, $completedAfterSeconds, $flush): string {
                     // Remove the cache slot independently of its logical expiry time.
                     $key = array_key_first($cache->getStore()->all());
                     Carbon::setTestNow($startedAt->copy()->addSeconds($invalidatedAfterSeconds));
@@ -536,7 +538,7 @@ final class CacheLifecycleTest extends TestCase
                     // Finish capture at or after invalidation, including across hard expiry.
                     Carbon::setTestNow($startedAt->copy()->addSeconds($completedAfterSeconds));
 
-                    return $body->getContents();
+                    return $body->read($length);
                 },
         ]);
 

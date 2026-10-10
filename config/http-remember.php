@@ -3,9 +3,9 @@
 /**
  * Configure the default policy for explicitly remembered HTTP requests.
  * Choose a fixed lifetime or [fresh, total lifetime] thresholds.
- * All durations are measured in seconds.
+ * Durations are measured in seconds. Sizes are measured in bytes.
  *
- * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, ignored_headers: list<string>}
+ * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, max_response_bytes: int, ignored_headers: list<string>}
  */
 return [
 
@@ -17,6 +17,9 @@ return [
 
     // Limit deferred refreshes to 15 seconds; preserve shorter request timeouts.
     'refresh_timeout' => 15,
+
+    // Cache response bodies up to 1 MB.
+    'max_response_bytes' => 1_000_000,
 
     // Ignore common tracing and correlation headers when generating cache keys.
     'ignored_headers' => [
