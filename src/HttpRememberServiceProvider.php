@@ -32,6 +32,16 @@ class HttpRememberServiceProvider extends ServiceProvider
     {
         // Merge package defaults with application configuration.
         $this->mergeConfigFrom(__DIR__.'/../config/http-remember.php', 'http-remember');
+
+        // Provide a dedicated rotating log while preserving application overrides for this channel.
+        if ($this->app['config']->get('logging.channels.http-remember') === null) {
+            $this->app['config']->set('logging.channels.http-remember', [
+                'driver' => 'daily',
+                'path' => $this->app->storagePath('logs/http-remember.log'),
+                'level' => 'debug',
+                'days' => 7,
+            ]);
+        }
     }
 
     /**

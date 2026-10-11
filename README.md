@@ -244,6 +244,12 @@ return [
     // Cache response bodies up to 1 MB.
     'max_response_bytes' => 1_000_000,
 
+    // Enable event logs during development and use the dedicated package log.
+    'event_logs' => [
+        'enabled' => in_array(env('APP_ENV', 'production'), ['local', 'development', 'dev'], true),
+        'channel' => 'http-remember',
+    ],
+
     // Exclude common tracing and correlation headers from cache keys.
     'ignored_headers' => [
         'traceparent',
@@ -263,6 +269,8 @@ return [
 - `store` is a configured cache store name. Leave it `null` to use your application's default, or set it to `'redis'` to use Redis.
 - `refresh_timeout` must be a positive integer. It caps network timeouts for deferred refreshes only. Shorter timeouts stay unchanged; unlimited or longer timeouts use this cap. It doesn't change timeouts for requests that callers wait for.
 - `max_response_bytes` must be a positive integer and defaults to **1 MB**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible; larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
+- `event_logs.enabled` defaults to `true` when `APP_ENV` is `local`, `development`, or `dev`, and `false` otherwise. Set it explicitly to enable or disable event log output in any environment. Laravel listeners still receive event logs when file output is disabled.
+- `event_logs.channel` defaults to `'http-remember'`. The package supplies a daily log at `storage/logs/http-remember-YYYY-MM-DD.log`, with a `debug` level and 7 days of retention. Define `logging.channels.http-remember` to customize that channel, choose another configured channel, or use `null` for the application's default. Existing cache failure warnings use the selected channel even when routine event log output is disabled.
 - `ignored_headers` is a list of request header names excluded from cache keys. The defaults cover common tracing and correlation headers, so changing a request ID does not create another cache entry. Names match case-insensitively; use lowercase names in configuration. Replace the list to customize it, or set it to `[]` to include all request headers. Headers are still sent upstream normally.
 
 Calling `remember()` without arguments uses these defaults. Passing a lifetime or store overrides that setting for one request.
@@ -294,6 +302,55 @@ The cache stores arrays and scalars for the response's status, headers, body, pr
 Responses containing `Set-Cookie` are still cached. Live responses deliver those cookies to their caller, while cached copies retain the body and other headers and omit `Set-Cookie`. Cookies already sent with a request remain part of its cache key, so different established sessions use separate entries. Use ordinary live requests for session creation or authentication flows that need fresh cookies or issue session credentials in the response body.
 
 Async requests and pools keep their usual promise behavior. Add `remember()` to each request inside a pool.
+
+## Event logs
+
+Event logs describe cache decisions and refresh outcomes. They are written to the dedicated package log by default in development environments. Other environments keep event log output disabled until you enable it in `config/http-remember.php`.
+
+Event logs use Laravel's standard log format. The message shows `[METHOD] hostname/path`, with the scheme, leading `www.`, port, credentials, query parameters, and fragment omitted for quick skimming. The request path keeps its original case and encoding; a request without a path shows `/`. The event type and all other fields are passed as a separate context array. The dedicated channel uses Laravel's normal formatter:
+
+```text
+[2026-01-01 12:00:10] local.DEBUG: [GET] api.example.com/products {"event":"hit","cache_key":"http-remember:...","store":"redis","group_hash":null,"reason":"stale","age":10.0,"status":200,"operation":null,"exception":null}
+```
+
+Failure warnings use the same request message and structured context at the `warning` level. They remain enabled when routine event log output is disabled, and a failed operation produces one warning rather than duplicate debug and warning records. Application channel overrides retain their own formatting.
+
+### Listen for event logs
+
+The package dispatches an immutable `HttpRememberEventLog` through Laravel for each decision, independently of log-channel output:
+
+```php
+use Illuminate\Support\Facades\Event;
+use PhilipAnnis\HttpRemember\HttpRememberEventLog;
+
+Event::listen(HttpRememberEventLog::class, function (HttpRememberEventLog $eventLog): void {
+    if ($eventLog->event === 'refresh_failed') {
+        // Record an application metric using the safe event log context.
+        $context = $eventLog->toArray();
+    }
+});
+```
+
+| Event log | Meaning |
+| --- | --- |
+| `hit` | A fresh or stale response was served; `reason` gives its freshness and `age` gives its age. |
+| `miss` | A live fetch is needed; `reason` identifies a missing, expired, invalid, or unusable entry. |
+| `bypass` | A request runs live because of its transport options, hooks, a cache read failure, or grouped mutation intent. |
+| `stored` | The cache accepted a live response or refreshed replacement. |
+| `not_stored` | A response was not persisted; `reason` identifies the eligibility, generation, lock, or write outcome. |
+| `refresh_scheduled` | A stale hit requested deferred work. |
+| `refresh_started` | Deferred work passed its generation checks and is about to contact the API. |
+| `refresh_succeeded` | A deferred refresh stored its replacement response. |
+| `refresh_skipped` | A refresh was cancelled, its lock was unavailable, or its response could not be stored. |
+| `refresh_failed` | A refresh failed during scheduling, transport, upstream handling, or cache persistence. |
+| `invalidated` | A successful grouped mutation replaced the group's generation. |
+| `failed` | A foreground request or cache operation failed; `operation` identifies the failed operation. |
+
+Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, and `exception`. Unavailable fields are `null`. `toArray()` uses `cache_key` and `group_hash` for log context. Keys and groups are hashed; records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.
+
+Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, and `request_body`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired` or `refresh_lock_unavailable`.
+
+Every stale hit emits `refresh_scheduled`, while Laravel deduplicates actual execution by callback name. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
 
 ## Refreshes and failures
 

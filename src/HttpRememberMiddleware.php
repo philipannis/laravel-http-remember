@@ -12,7 +12,6 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use ReflectionFunction;
@@ -28,6 +27,7 @@ use function Illuminate\Support\defer;
  * @internal
  *
  * @phpstan-type Handler callable(RequestInterface, array<string, mixed>): PromiseInterface
+ * @phpstan-type EventLogger Closure(string, string|null, array<string, int|float|string|null>, bool=): void
  */
 final class HttpRememberMiddleware
 {
@@ -95,21 +95,28 @@ final class HttpRememberMiddleware
              * @return PromiseInterface The cached or live response promise.
              */
             function (RequestInterface $request, array $options) use ($handler, $canCache, $onHit): PromiseInterface {
+                // Retain the selected store for event logs even if the default changes before a refresh.
+                $store = $this->settings->store ?? config('cache.default');
+                $eventLog = $this->eventLogger($request, $store);
+
                 // Send grouped mutation methods live unless explicitly marked as read operations.
                 if ($this->settings->groupHash !== null
                     && $this->settings->operation !== 'read'
                     && ! in_array($request->getMethod(), ['GET', 'HEAD', 'OPTIONS', 'TRACE'], true)) {
-                    return $this->sendAndInvalidate($handler, $request, $options);
+                    return $this->sendAndInvalidate($handler, $request, $options, $eventLog);
                 }
 
                 // Avoid consuming uploads, streams, or downloads with transfer side effects.
-                if ($this->shouldBypassCache($request, $options, $canCache)) {
-                    return $handler($request, $options);
+                if (($reason = $this->bypassReason($request, $options, $canCache)) !== null) {
+                    $eventLog('bypass', null, ['reason' => $reason]);
+
+                    return $this->sendLive($handler, $request, $options, null, $eventLog);
                 }
 
                 // Keep diagnostics and cache-hit state available when a cache read fails.
                 $key = null;
                 $response = null;
+                $reason = 'missing';
 
                 // Treat cache failures as misses without intercepting network exceptions.
                 try {
@@ -121,42 +128,54 @@ final class HttpRememberMiddleware
 
                     // Fingerprint the prepared request and its current invalidation generation.
                     $key = $this->cacheKey($request, $options, $group);
-                    $cached = HttpRememberResponse::restore($cache->get($key));
+                    $payload = $cache->get($key);
+                    $cached = HttpRememberResponse::restore($payload);
 
-                    // Enforce hard expiry and skip groups invalidated while reading the response.
-                    if ($cached !== null
-                        && ! $cached->hasReached($this->settings->lifetime)
-                        && ($group === null || $group->isCurrent())) {
+                    // Describe misses while enforcing hard expiry and current group generations.
+                    if ($cached === null) {
+                        $reason = $payload === null ? 'missing' : 'invalid_entry';
+                    } elseif ($cached->hasReached($this->settings->lifetime)) {
+                        $reason = 'expired';
+                    } elseif ($group !== null && ! $group->isCurrent()) {
+                        $reason = 'group_invalidated';
+                    } else {
                         // Reconstruct the response before inspecting its declared header dependencies.
                         $candidate = $cached->toResponse();
 
                         // Recheck entries stored before the ignored-header configuration changed.
                         if (! $this->variesOnIgnoredHeaders($candidate)) {
                             $response = $candidate;
+                        } else {
+                            $reason = 'vary';
                         }
                     }
                 } catch (Throwable $exception) {
                     // Report the cache failure without exposing the exception message.
-                    $this->logFailure('read', $key, ['exception' => $exception::class]);
+                    $this->logFailure('read', $key, ['exception' => $exception::class], $eventLog);
+                    $eventLog('bypass', $key, ['reason' => 'cache_read_failed']);
 
                     // Let the live request retain Laravel's normal error handling.
-                    return $handler($request, $options);
+                    return $this->sendLive($handler, $request, $options, $key, $eventLog);
                 }
 
                 // Keep application event failures outside cache failure handling.
                 if ($response !== null) {
+                    // Identify stale cache hits before scheduling their deferred refresh.
+                    $stale = $cached->hasReached($this->settings->fresh);
+
                     // Restore Laravel's request metadata and events for the cached response.
                     $onHit($request, $options);
+                    $eventLog('hit', $key, ['reason' => $stale ? 'stale' : 'fresh', 'age' => $cached->age(), 'status' => $response->getStatusCode()]);
 
                     // Keep a usable stale response even if refresh scheduling fails.
-                    if ($cached->hasReached($this->settings->fresh)) {
+                    if ($stale) {
                         // Contain scheduling failures while preserving the cache hit.
                         try {
                             // Defer a refresh of the generation served to this caller.
-                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group);
+                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group, $eventLog);
                         } catch (Throwable $exception) {
                             // Report the scheduling failure using safe exception metadata.
-                            $this->logFailure('refresh', $key, ['exception' => $exception::class]);
+                            $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
                         }
                     }
 
@@ -165,7 +184,9 @@ final class HttpRememberMiddleware
                 }
 
                 // Populate an absent or expired entry only after an eligible response.
-                return $this->sendAndRemember($handler, $request, $options, $cache, $key, null, $group);
+                $eventLog('miss', $key, ['reason' => $reason]);
+
+                return $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, null, $group);
             };
     }
 
@@ -175,9 +196,10 @@ final class HttpRememberMiddleware
      * @param  ResponseInterface  $response  The live foreground or deferred refresh response.
      * @param  HttpRememberResponse  $cached  The captured body used for independent inspection.
      * @param  string  $key  The hashed response cache key used for safe diagnostics.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      * @return bool Whether the live response can be stored under the application's cache policy.
      */
-    private function allowsResponse(ResponseInterface $response, HttpRememberResponse $cached, string $key): bool
+    private function allowsResponse(ResponseInterface $response, HttpRememberResponse $cached, string $key, Closure $eventLog): bool
     {
         // Keep ordinary caching free from additional response inspection when no predicate is supplied.
         if ($this->settings->cacheWhen === null) {
@@ -199,7 +221,7 @@ final class HttpRememberMiddleware
             return $eligible;
         } catch (Throwable $exception) {
             // Reject caching while preserving the live response and omitting sensitive exception details.
-            $this->logFailure('eligibility', $key, ['exception' => $exception::class]);
+            $this->logFailure('eligibility', $key, ['exception' => $exception::class], $eventLog);
 
             return false;
         }
@@ -211,29 +233,33 @@ final class HttpRememberMiddleware
      * @param  Handler  $handler  The next handler in the outgoing request stack.
      * @param  RequestInterface  $request  The mutation that must reach the API.
      * @param  array<string, mixed>  $options  The original Guzzle transfer options.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      * @return PromiseInterface The unchanged live response or transport rejection.
      */
-    private function sendAndInvalidate(callable $handler, RequestInterface $request, array $options): PromiseInterface
+    private function sendAndInvalidate(callable $handler, RequestInterface $request, array $options, Closure $eventLog): PromiseInterface
     {
+        // Grouped mutations run live and report their cache bypass explicitly.
+        $eventLog('bypass', null, ['reason' => 'mutation']);
+
         // Bind invalidation to the store selected before the mutation starts.
         try {
             $cache = Cache::store($this->settings->store);
         } catch (Throwable $exception) {
             // Preserve the live mutation when its cache store cannot be resolved.
-            $this->logFailure('invalidate', null, ['exception' => $exception::class]);
+            $this->logFailure('invalidate', null, ['exception' => $exception::class], $eventLog);
 
-            return $handler($request, $options);
+            return $this->sendLive($handler, $request, $options, null, $eventLog);
         }
 
         // Invalidate without buffering, caching, or deferring the mutation response.
-        return $handler($request, $options)->then(
+        return $this->sendLive($handler, $request, $options, null, $eventLog)->then(
             /**
              * Rotate the matching group after the upstream operation completes.
              *
              * @param  ResponseInterface  $response  The live upstream response.
              * @return ResponseInterface The original response received by the caller.
              */
-            function (ResponseInterface $response) use ($cache): ResponseInterface {
+            function (ResponseInterface $response) use ($cache, $eventLog): ResponseInterface {
                 // Invalidate redirects before their follow-up reads while preserving failed mutations.
                 if ($response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_BAD_REQUEST) {
                     return $response;
@@ -242,11 +268,13 @@ final class HttpRememberMiddleware
                 // Keep invalidation failures separate from the completed HTTP operation.
                 try {
                     if (! HttpRememberGroup::invalidate($cache, $this->settings->groupHash)) {
-                        $this->logFailure('invalidate', null);
+                        $this->logFailure('invalidate', null, [], $eventLog);
+                    } else {
+                        $eventLog('invalidated', null, ['status' => $response->getStatusCode()]);
                     }
                 } catch (Throwable $exception) {
                     // Report failures without exposing request or group values.
-                    $this->logFailure('invalidate', null, ['exception' => $exception::class]);
+                    $this->logFailure('invalidate', null, ['exception' => $exception::class], $eventLog);
                 }
 
                 // Preserve Laravel's normal handling of the live mutation response.
@@ -256,30 +284,43 @@ final class HttpRememberMiddleware
     }
 
     /**
-     * Determine whether a transfer is unsuitable for response caching.
+     * Describe why a transfer is unsuitable for response caching.
      *
      * @param  RequestInterface  $request  The prepared outgoing request.
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
-     * @return bool Whether the request must pass through without caching.
+     * @return string|null The bypass reason, or null when caching can proceed.
      */
-    private function shouldBypassCache(RequestInterface $request, array $options, Closure $canCache): bool
+    private function bypassReason(RequestInterface $request, array $options, Closure $canCache): ?string
     {
         // Avoid caching an identity that a later middleware or callback might change.
         if (! $canCache()) {
-            return true;
+            return 'request_hooks';
         }
 
         // Preserve Guzzle's header and trailer callbacks and their normal rejection handling.
-        if (isset($options['on_headers']) || isset($options['on_trailers'])) {
-            return true;
+        if (isset($options['on_headers'])) {
+            return 'on_headers';
+        }
+        if (isset($options['on_trailers'])) {
+            return 'on_trailers';
         }
 
         // Preserve streaming, file downloads, multipart uploads, and custom transport behavior.
-        if (($options['stream'] ?? false) || isset($options['sink']) || ! empty($options['curl'])
-            || ! empty($options['stream_context'])
-            || str_starts_with(strtolower($request->getHeaderLine('Content-Type')), 'multipart/')) {
-            return true;
+        if ($options['stream'] ?? false) {
+            return 'stream';
+        }
+        if (isset($options['sink'])) {
+            return 'sink';
+        }
+        if (! empty($options['curl'])) {
+            return 'curl';
+        }
+        if (! empty($options['stream_context'])) {
+            return 'stream_context';
+        }
+        if (str_starts_with(strtolower($request->getHeaderLine('Content-Type')), 'multipart/')) {
+            return 'multipart';
         }
 
         // Inspect the upload stream without consuming its contents.
@@ -287,10 +328,10 @@ final class HttpRememberMiddleware
 
         // Cache only readable, seekable bodies positioned at the beginning of the stream.
         try {
-            return ! $body->isReadable() || ! $body->isSeekable() || $body->tell() !== 0;
+            return ! $body->isReadable() || ! $body->isSeekable() || $body->tell() !== 0 ? 'request_body' : null;
         } catch (Throwable) {
             // Let the original handler decide how to handle an unusable request stream.
-            return true;
+            return 'request_body';
         }
     }
 
@@ -382,6 +423,7 @@ final class HttpRememberMiddleware
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  Repository  $cache  The selected Laravel cache repository.
      * @param  string  $key  The generated response cache key.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      * @param  HttpRememberResponse|null  $generation  The response to replace, or null for a cache miss.
      * @param  HttpRememberGroup|null  $group  The group generation observed before the transfer.
      * @return PromiseInterface The original response with cache persistence attached.
@@ -392,30 +434,44 @@ final class HttpRememberMiddleware
         array $options,
         Repository $cache,
         string $key,
+        Closure $eventLog,
         ?HttpRememberResponse $generation = null,
         ?HttpRememberGroup $group = null,
     ): PromiseInterface {
+        // Report foreground transport failures while deferred errors retain their refresh diagnostics.
+        $promise = $generation === null
+            ? $this->sendLive($handler, $request, $options, $key, $eventLog)
+            : $handler($request, $options);
+
         // Leave rejected promises and Laravel's foreground error handling unchanged.
-        return $handler($request, $options)->then(
+        return $promise->then(
             /**
              * Store a successful response without turning cache failures into HTTP failures.
              *
              * @param  ResponseInterface  $response  The live upstream response.
              * @return ResponseInterface The unchanged upstream response.
              */
-            function (ResponseInterface $response) use ($cache, $key, $generation, $group): ResponseInterface {
+            function (ResponseInterface $response) use ($cache, $key, $generation, $group, $eventLog): ResponseInterface {
+                // Keep every persistence outcome observable after the write lock is released.
+                $outcome = 'write_lock_unavailable';
+
                 // Keep response capture and cache persistence optional for the caller.
                 try {
                     // Preserve declared response variants that the filtered key cannot distinguish.
                     if ($this->variesOnIgnoredHeaders($response)) {
+                        $this->recordStorageOutcome($eventLog, $key, 'vary', $response, $generation);
+
                         return $response;
                     }
 
                     // Buffer first so a slow stream cannot invalidate the generation check.
-                    $cached = HttpRememberResponse::capture($response, $this->settings->maxResponseBytes);
+                    $reason = null;
+                    $cached = HttpRememberResponse::capture($response, $this->settings->maxResponseBytes, $reason);
 
                     // Persist only serializable successful responses accepted by the active predicate.
-                    if ($cached === null || ! $this->allowsResponse($response, $cached, $key)) {
+                    if ($cached === null || ! $this->allowsResponse($response, $cached, $key, $eventLog)) {
+                        $this->recordStorageOutcome($eventLog, $key, $reason ?? 'response_predicate', $response, $generation);
+
                         return $response;
                     }
 
@@ -426,9 +482,11 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($cache, $key, $generation, $cached, $group): void {
+                        function () use ($cache, $key, $generation, $cached, $group, $eventLog, &$outcome): void {
                             // Cancel writes started before a successful mutation or metadata removal.
                             if ($group !== null && ! $group->isCurrent()) {
+                                $outcome = 'group_invalidated';
+
                                 return;
                             }
 
@@ -442,6 +500,8 @@ final class HttpRememberMiddleware
 
                             // Preserve replacements and cancel refreshes whose generation was removed.
                             if ($current?->id() !== $generation?->id()) {
+                                $outcome = 'generation_changed';
+
                                 return;
                             }
 
@@ -453,7 +513,10 @@ final class HttpRememberMiddleware
 
                             // Report stores that reject a write without throwing an exception.
                             if (! $cache->put($key, $cached->toArray(), $retention)) {
-                                $this->logFailure('write', $key);
+                                $outcome = 'cache_write_failed';
+                                $this->logFailure('write', $key, [], $eventLog);
+                            } else {
+                                $outcome = 'stored';
                             }
                         };
 
@@ -469,13 +532,46 @@ final class HttpRememberMiddleware
                     }
                 } catch (Throwable $exception) {
                     // Preserve the response when capturing or storing it fails.
-                    $this->logFailure('write', $key, ['exception' => $exception::class]);
+                    $outcome = 'cache_write_failed';
+                    $this->logFailure('write', $key, ['exception' => $exception::class], $eventLog);
                 }
+
+                // Publish persistence and refresh results without holding a cache write lock.
+                $this->recordStorageOutcome($eventLog, $key, $outcome, $response, $generation);
 
                 // Preserve the caller's normal response even if caching was unavailable.
                 return $response;
             },
         );
+    }
+
+    /**
+     * Publish the final persistence decision and any associated deferred refresh outcome.
+     *
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
+     * @param  string  $key  The hashed response cache key.
+     * @param  string  $outcome  Stored or the reason persistence did not complete.
+     * @param  ResponseInterface  $response  The unchanged live upstream response.
+     * @param  HttpRememberResponse|null  $generation  The refreshed generation, or null for foreground work.
+     */
+    private function recordStorageOutcome(Closure $eventLog, string $key, string $outcome, ResponseInterface $response, ?HttpRememberResponse $generation): void
+    {
+        // Report every live response's storage decision without exposing its contents.
+        $context = ['reason' => $outcome === 'stored' ? null : $outcome, 'status' => $response->getStatusCode()];
+        $eventLog($outcome === 'stored' ? 'stored' : 'not_stored', $key, $context);
+
+        // Unsuccessful upstream refreshes are reported through the existing failure path.
+        if ($generation === null || $response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_MULTIPLE_CHOICES) {
+            return;
+        }
+
+        // Distinguish a stored replacement from a cancelled refresh or failed persistence.
+        $event = match ($outcome) {
+            'stored' => 'refresh_succeeded',
+            'cache_write_failed' => 'refresh_failed',
+            default => 'refresh_skipped',
+        };
+        $eventLog($event, $key, $context);
     }
 
     /**
@@ -489,6 +585,7 @@ final class HttpRememberMiddleware
      * @param  HttpRememberResponse  $generation  The stale response and its original expiry metadata.
      * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
      * @param  HttpRememberGroup|null  $group  The group generation served by the stale response.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      */
     private function refreshLater(
         callable $handler,
@@ -499,6 +596,7 @@ final class HttpRememberMiddleware
         HttpRememberResponse $generation,
         Closure $canCache,
         ?HttpRememberGroup $group,
+        Closure $eventLog,
     ): void {
         // Retain the original stream while preparing an independent deferred request.
         $body = $request->getBody();
@@ -541,7 +639,7 @@ final class HttpRememberMiddleware
              *
              * @return void
              */
-            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group): void {
+            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog): void {
                 // Contain refresh failures after the caller has received its response.
                 try {
                     // Recheck the generation after acquiring any available refresh lock.
@@ -551,25 +649,30 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group): void {
+                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog): void {
                             // Skip expired responses and groups invalidated before deferred execution.
-                            if ($generation->hasReached($this->settings->lifetime)
-                                || ($group !== null && ! $group->isCurrent())
-                                || HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id()) {
+                            $reason = match (true) {
+                                $generation->hasReached($this->settings->lifetime) => 'expired',
+                                $group !== null && ! $group->isCurrent() => 'group_invalidated',
+                                HttpRememberResponse::restore($cache->get($key))?->id() !== $generation->id() => 'generation_changed',
+                                ! $canCache() => 'request_hooks',
+                                default => null,
+                            };
+                            if ($reason !== null) {
+                                $eventLog('refresh_skipped', $key, ['reason' => $reason]);
+
                                 return;
                             }
 
-                            // Cancel refreshes when later builder mutations could change the cached request's identity.
-                            if (! $canCache()) {
-                                return;
-                            }
+                            // Record actual refresh work after every cancellation check passes.
+                            $eventLog('refresh_started', $key, ['age' => $generation->age()]);
 
                             // Wait only during deferred execution, never while serving stale data.
-                            $response = $this->sendAndRemember($handler, $request, $options, $cache, $key, $generation, $group)->wait();
+                            $response = $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, $generation, $group)->wait();
 
                             // Log unsuccessful refreshes while retaining the original expiry.
                             if ($response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_MULTIPLE_CHOICES) {
-                                $this->logFailure('refresh', $key, ['status' => $response->getStatusCode()]);
+                                $this->logFailure('refresh', $key, ['status' => $response->getStatusCode()], $eventLog);
                             }
                         };
 
@@ -579,34 +682,117 @@ final class HttpRememberMiddleware
                     // Keep the refresh locked through the network timeout and cache write.
                     if ($store instanceof LockProvider) {
                         $lockSeconds = (int) ceil($options['timeout']) + self::REFRESH_LOCK_BUFFER_SECONDS;
-                        $store->lock($key.':refresh', $lockSeconds)->get($refresh);
+                        if ($store->lock($key.':refresh', $lockSeconds)->get($refresh) === false) {
+                            $eventLog('refresh_skipped', $key, ['reason' => 'refresh_lock_unavailable']);
+                        }
                     } else {
                         // Run the deferred refresh when the store has no lock support.
                         $refresh();
                     }
                 } catch (Throwable $exception) {
                     // Record a safe diagnostic without changing the cached response.
-                    $this->logFailure('refresh', $key, ['exception' => $exception::class]);
+                    $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
                 }
             },
             $name,
         )->always();
+
+        // Each stale hit requests scheduling; Laravel deduplicates execution by callback name.
+        $eventLog('refresh_scheduled', $key, ['age' => $generation->age()]);
     }
 
     /**
-     * Report a cache problem without exposing URLs, headers, bodies, or exception messages.
+     * Send a live transfer and report transport failures without replacing their rejection.
+     *
+     * @param  Handler  $handler  The next handler in the outgoing request stack.
+     * @param  RequestInterface  $request  The prepared live request.
+     * @param  array<string, mixed>  $options  The unchanged Guzzle transfer options.
+     * @param  string|null  $key  The hashed cache key, if one was generated.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
+     * @return PromiseInterface The unchanged live response or transport rejection.
+     */
+    private function sendLive(callable $handler, RequestInterface $request, array $options, ?string $key, Closure $eventLog): PromiseInterface
+    {
+        // Preserve immediate transport exceptions while reporting their safe class metadata.
+        try {
+            $promise = $handler($request, $options);
+        } catch (Throwable $exception) {
+            $eventLog('failed', $key, ['operation' => 'request', 'exception' => $exception::class]);
+
+            throw $exception;
+        }
+
+        // Leave fulfilled responses untouched and retain the usual Guzzle rejection path.
+        return $promise->then(
+            null,
+            /**
+             * Report transport rejections without replacing their reason.
+             *
+             * @param  mixed  $reason  The original rejected promise reason.
+             * @return PromiseInterface The unchanged transport rejection.
+             */
+            static function (mixed $reason) use ($key, $eventLog): PromiseInterface {
+                $eventLog('failed', $key, ['operation' => 'request', 'exception' => $reason instanceof Throwable ? $reason::class : null]);
+
+                return Create::rejectionFor($reason);
+            },
+        );
+    }
+
+    /**
+     * Bind event logs to one transfer's request message, selected store, and invalidation group.
+     *
+     * @param  RequestInterface  $request  The prepared outgoing request.
+     * @param  string|null  $store  The cache store selected before the transfer starts.
+     * @return EventLogger The publisher reused by the transfer and its deferred refresh.
+     */
+    private function eventLogger(RequestInterface $request, ?string $store): Closure
+    {
+        // Capture immutable identifiers instead of reading mutable defaults during deferred work.
+        $groupHash = $this->settings->groupHash;
+
+        // Show the method, shortened hostname, and path without credentials, queries, or fragments.
+        $uri = $request->getUri();
+        $hostname = strtolower($uri->getHost());
+        $hostname = str_starts_with($hostname, 'www.') ? substr($hostname, 4) : $hostname;
+        $path = $uri->getPath();
+        $message = '['.strtoupper($request->getMethod()).'] '.$hostname.($path === '' ? '/' : $path);
+
+        return
+            /**
+             * Publish a cache decision using only the supported safe diagnostic fields.
+             *
+             * @param  string  $event  The decision or lifecycle outcome.
+             * @param  string|null  $key  The hashed response key, when available.
+             * @param  array<string, int|float|string|null>  $context  Safe outcome metadata.
+             * @param  bool  $warning  Whether this failure must remain visible when routine logs are disabled.
+             */
+            static function (string $event, ?string $key, array $context = [], bool $warning = false) use ($store, $groupHash, $message): void {
+                (new HttpRememberEventLog(
+                    $event,
+                    $key,
+                    $store,
+                    $groupHash,
+                    $context['reason'] ?? null,
+                    $context['age'] ?? null,
+                    $context['status'] ?? null,
+                    $context['operation'] ?? null,
+                    $context['exception'] ?? null,
+                ))->publish($message, $warning);
+            };
+    }
+
+    /**
+     * Report a cache problem without exposing credentials, queries, headers, bodies, or exception messages.
      *
      * @param  string  $operation  The cache operation that could not be completed.
      * @param  string|null  $key  The hashed cache key, if one was generated.
      * @param  array<string, int|string>  $context  Safe status or exception-class metadata.
+     * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      */
-    private function logFailure(string $operation, ?string $key, array $context = []): void
+    private function logFailure(string $operation, ?string $key, array $context, Closure $eventLog): void
     {
-        // Keep diagnostics useful without logging request credentials or response contents.
-        try {
-            Log::warning('HTTP remember '.$operation.' failed.', ['cache_key' => $key] + $context);
-        } catch (Throwable) {
-            // A logging outage must not interrupt an otherwise usable HTTP response.
-        }
+        // Keep the request message and complete event context on failure warnings without duplicating records.
+        $eventLog($operation === 'refresh' ? 'refresh_failed' : 'failed', $key, ['operation' => $operation] + $context, true);
     }
 }

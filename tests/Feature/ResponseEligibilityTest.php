@@ -142,14 +142,17 @@ final class ResponseEligibilityTest extends TestCase
     public function test_predicate_failures_preserve_live_responses(string $failure, string $exception): void
     {
         // Require diagnostics to omit response contents and the predicate's exception message.
+        Log::shouldReceive('channel')->once()->with('http-remember')->andReturnSelf();
         Log::shouldReceive('warning')->once()->with(
-            'HTTP remember eligibility failed.',
+            '[GET] api.example.test/products',
             Mockery::on(
                 /**
-                 * Check that warnings contain only the hashed key and exception class.
+                 * Check that warnings retain event context without leaking private exception details.
                  */
-                static fn (array $context): bool => count($context) === 2
+                static fn (array $context): bool => count($context) === 9
                     && preg_match('/^http-remember:[a-f0-9]{64}$/', $context['cache_key']) === 1
+                    && $context['event'] === 'failed'
+                    && $context['operation'] === 'eligibility'
                     && $context['exception'] === $exception,
             ),
         );
@@ -234,6 +237,7 @@ final class ResponseEligibilityTest extends TestCase
         $startedAt = Carbon::parse(self::STARTED_AT);
         Carbon::setTestNow($startedAt);
         Http::fakeSequence()->push(['version' => 1])->push(['errors' => ['Unavailable']])->push(['version' => 2]);
+        Log::shouldReceive('channel')->times($throw ? 1 : 0)->with('http-remember')->andReturnSelf();
         Log::shouldReceive('warning')->times($throw ? 1 : 0);
         $pending = Http::remember([10, 60], cacheWhen:
             /**

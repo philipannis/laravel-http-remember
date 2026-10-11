@@ -710,6 +710,7 @@ final class GroupsTest extends TestCase
             $write->andReturnFalse();
         }
         Cache::shouldReceive('store')->once()->with(null)->andReturn($cache);
+        Log::shouldReceive('channel')->once()->with('http-remember')->andReturnSelf();
         Log::shouldReceive('warning')->once();
         $this->fakeVersionedApi();
 
@@ -740,6 +741,7 @@ final class GroupsTest extends TestCase
         $cache->shouldReceive('get')->once()->andReturnNull();
         $cache->shouldReceive('forever')->once()->andReturnFalse();
         Cache::shouldReceive('store')->once()->with(null)->andReturn($cache);
+        Log::shouldReceive('channel')->once()->with('http-remember')->andReturnSelf();
         Log::shouldReceive('warning')->once();
         $this->fakeVersionedApi();
 
@@ -755,6 +757,7 @@ final class GroupsTest extends TestCase
     {
         // Fail before invalidation can acquire a cache repository.
         Cache::shouldReceive('store')->once()->with(null)->andThrow(new RuntimeException('Test store failure.'));
+        Log::shouldReceive('channel')->once()->with('http-remember')->andReturnSelf();
         Log::shouldReceive('warning')->once();
         $this->fakeVersionedApi();
 
