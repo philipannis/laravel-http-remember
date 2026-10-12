@@ -19,6 +19,13 @@ final readonly class HttpRememberOptions
     public const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
 
     /**
+     * The credential-bearing request headers that must remain part of every cache fingerprint.
+     *
+     * @var list<string>
+     */
+    private const CREDENTIAL_HEADERS = ['authorization', 'proxy-authorization', 'cookie'];
+
+    /**
      * The age at which a cached response becomes stale.
      */
     public int $fresh;
@@ -110,6 +117,13 @@ final readonly class HttpRememberOptions
 
         // Match field names case-insensitively without repeatedly normalizing configuration.
         $this->ignoredHeaders = array_values(array_unique(array_map(strtolower(...), $ignoredHeaders)));
+
+        // Reject exclusions that could share authenticated or session responses between callers.
+        foreach ($this->ignoredHeaders as $header) {
+            if (in_array($header, self::CREDENTIAL_HEADERS, true)) {
+                throw new InvalidArgumentException('The HTTP remember ignored headers must not include '.$header.' because it may contain credentials.');
+            }
+        }
 
         // Reserve null for automatic detection and accept only explicit read intent.
         if ($operation !== null && $operation !== 'read') {
