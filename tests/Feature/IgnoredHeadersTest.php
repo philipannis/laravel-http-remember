@@ -9,6 +9,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use InvalidArgumentException;
 use PhilipAnnis\HttpRemember\Tests\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -143,6 +144,70 @@ final class IgnoredHeadersTest extends TestCase
         self::assertSame(self::UPDATED_VERSION, $second->json('version'));
         self::assertSame($first->json(), $firstAgain->json());
         Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm credential exclusions fail before a live request or cache lookup can run.
+     *
+     * @param  string  $header  The credential-bearing header proposed for exclusion.
+     */
+    #[DataProvider('credentialHeaders')]
+    public function test_credential_header_exclusions_are_rejected_before_sending(string $header): void
+    {
+        // Populate a credential-sensitive response before the application's exclusions change.
+        $this->fakeVersionSequence();
+        Http::withHeaders([$header => 'first-credential'])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+        $cached = Cache::store()->getStore()->all();
+        config(['http-remember.ignored_headers' => ['x-request-id', strtoupper($header)]]);
+
+        // Reject the invalid policy instead of sending or caching another caller's request.
+        try {
+            Http::withHeaders([$header => 'second-credential'])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
+            self::fail('The request accepted a credential header exclusion.');
+        } catch (InvalidArgumentException $exception) {
+            self::assertSame('The HTTP remember ignored headers must not include '.strtolower($header).' because it may contain credentials.', $exception->getMessage());
+        }
+
+        // Leave the upstream call count and the existing cache generation unchanged.
+        Http::assertSentCount(1);
+        self::assertSame($cached, Cache::store()->getStore()->all());
+    }
+
+    /**
+     * Provide the standard request headers carrying authentication or session credentials.
+     *
+     * @return iterable<string, array{string}> Credential headers keyed by their lowercase names.
+     */
+    public static function credentialHeaders(): iterable
+    {
+        // Cover direct authorization, proxy authorization, and established session cookies.
+        yield 'authorization' => ['Authorization'];
+        yield 'proxy authorization' => ['Proxy-Authorization'];
+        yield 'session cookies' => ['Cookie'];
+    }
+
+    /**
+     * Confirm unsafe configuration cannot replace a builder's previously valid cache policy.
+     */
+    public function test_credential_header_exclusion_preserves_the_previous_policy(): void
+    {
+        // Populate a builder whose credential-sensitive policy must survive invalid configuration.
+        $this->fakeVersionSequence();
+        $pending = Http::withToken('first-credential')->remember(self::LIFETIME_SECONDS);
+        $initial = $pending->get(self::API_URL);
+        config(['http-remember.ignored_headers' => ['Authorization']]);
+
+        // Validate the replacement before changing the builder's active middleware.
+        try {
+            $pending->remember([0, 1]);
+            self::fail('The request replaced its policy with a credential header exclusion.');
+        } catch (InvalidArgumentException) {
+            self::assertSame($initial->json(), $pending->get(self::API_URL)->json());
+        }
+
+        // Keep the original fixed lifetime without scheduling a refresh or making another live call.
+        Http::assertSentCount(1);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
     }
 
     /**

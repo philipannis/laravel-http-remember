@@ -262,6 +262,42 @@ final class OptionsTest extends TestCase
     }
 
     /**
+     * Confirm credential headers cannot be excluded using any supported casing.
+     *
+     * @param  string  $header  The credential-bearing header proposed for exclusion.
+     */
+    #[DataProvider('credentialHeaders')]
+    public function test_credential_headers_cannot_be_ignored(string $header): void
+    {
+        // Reject unsafe exclusions before a request can share another caller's cache entry.
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('The HTTP remember ignored headers must not include '.strtolower($header).' because it may contain credentials.');
+
+        // Keep the guard active when the same list also contains ordinary tracing fields.
+        new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            ignoredHeaders: ['x-request-id', $header],
+        );
+    }
+
+    /**
+     * Provide credential headers in lowercase, uppercase, and their conventional casing.
+     *
+     * @return iterable<string, array{string}> Protected headers keyed by their exact spelling.
+     */
+    public static function credentialHeaders(): iterable
+    {
+        // Preserve authorization, proxy credentials, and session cookies in every fingerprint.
+        foreach (['Authorization', 'Proxy-Authorization', 'Cookie'] as $header) {
+            yield strtolower($header) => [strtolower($header)];
+            yield strtoupper($header) => [strtoupper($header)];
+            yield $header => [$header];
+        }
+    }
+
+    /**
      * Confirm unsupported operation values cannot create a request policy.
      *
      * @param  mixed  $operation  The unsupported operation value.
