@@ -4,7 +4,7 @@
 ![Laravel](https://img.shields.io/badge/Laravel-12%20%7C%2013-FF2D20?style=flat-square)
 [![License](https://img.shields.io/badge/license-MIT-334155?style=flat-square)](LICENSE)
 
-Add `remember()` to Laravel's HTTP client to cache successful API responses. It handles cache keys, response storage, and refreshes using your application's cache store. Use `group` to invalidate related cached reads after a live mutation. Requests without `remember()` skip the package entirely.
+Add `remember()` to Laravel's HTTP client to cache successful API responses. It handles cache keys, response storage, and refreshes using your application's cache store. Use `group` to invalidate related cached reads after a live mutation or with `invalidate: true`. Requests without `remember()` skip the package entirely.
 
 ## Contents
 
@@ -181,6 +181,32 @@ Group state lives in the selected cache store. Use the same store for related re
 
 GET, HEAD, OPTIONS, and TRACE are treated as reads. Other methods, including POST, PUT, PATCH, and DELETE, are treated as mutations when a group is supplied. Mutations are never served from the cache, stored as cached responses, or repeated during deferred refreshes. A 2xx or 3xx response invalidates the group. A 4xx, 5xx, or connection failure preserves it. Redirects invalidate before their follow-up requests run.
 
+### Invalidate a group directly
+
+Pass `invalidate: true` to `remember()` when a webhook, local update, or other application action should invalidate related reads:
+
+```php
+// Invalidate the exact group immediately without sending an HTTP request.
+Http::remember(group: ['tenant:42', 'products'], invalidate: true);
+
+// Invalidate the same group in an explicitly selected cache store.
+Http::remember(store: 'redis', group: ['tenant:42', 'products'], invalidate: true);
+```
+
+Invalidation runs once when `remember()` is called. It affects every cached URL, payload, credential, and lifetime variant in that exact group and selected store. Other groups and ungrouped responses keep their existing lifetimes. Pending refreshes are cancelled, and older in-flight reads or refreshes cannot populate the replacement group generation.
+
+The call still returns a normal configured request builder, so you can invalidate and fetch an updated response in one chain:
+
+```php
+// Invalidate once, then fetch and cache an updated list for ten minutes.
+$products = Http::remember(600, group: ['tenant:42', 'products'], invalidate: true)
+    ->get('https://api.example.com/products');
+```
+
+Reusing that builder keeps ordinary caching behavior. It does not invalidate again on each request. Call `remember(..., invalidate: true)` again when the group changes.
+
+`invalidate` defaults to `false`. Direct invalidation requires a non-empty `group`; omitting it, passing `null`, or passing an empty list throws `InvalidArgumentException`. The same group validation, exact matching, and store defaults apply. Cache failures are logged through the existing `failed` event with `operation: 'invalidate'` and preserve the usual builder return value.
+
 ### Cache POST searches and other reads
 
 Use `operation: 'read'` when a method normally associated with writes performs a read. This works for POST searches, reports, RPC calls, GraphQL queries, and other APIs:
@@ -230,6 +256,7 @@ Cloning a builder preserves its current policy. Calling `remember()` on the clon
 | `remember()` with no group | Cache eligible responses for any method. |
 | `remember(group: [...])` | Cache reads and invalidate the group after live mutations. |
 | `remember(group: [...], operation: 'read')` | Cache an eligible read using any HTTP method. |
+| `remember(group: [...], invalidate: true)` | Invalidate the group immediately, then configure ordinary remembered requests. |
 
 Omit `operation` to use automatic method detection for grouped requests: a GET remains a cacheable read, while POST, PUT, PATCH, and DELETE run live and invalidate the group. When supplied, `operation` accepts only the exact string `'read'`, which enables caching for any eligible method. Other strings and explicit `null` throw `InvalidArgumentException`. Unsupported argument types are also rejected. Operation settings retain the response eligibility and bypass rules below.
 
@@ -375,6 +402,8 @@ Event logs use Laravel's standard log format. The message shows `[METHOD] hostna
 
 Failure warnings use the same request message and structured context at the `warning` level. They remain enabled when routine event log output is disabled, and a failed operation produces one warning rather than duplicate debug and warning records. Application channel overrides retain their own formatting.
 
+Direct group invalidation uses the message `HTTP remember group invalidation.` or `HTTP remember group invalidation failed.` with the selected store, hashed group, and `operation: 'invalidate'`. Its request key and HTTP status are `null` because it sends no HTTP request.
+
 ### Listen for event logs
 
 The package dispatches an immutable `HttpRememberEventLog` through Laravel for each decision, independently of log-channel output:
@@ -403,7 +432,7 @@ Event::listen(HttpRememberEventLog::class, function (HttpRememberEventLog $event
 | `refresh_succeeded` | A deferred refresh stored its replacement response. |
 | `refresh_skipped` | A refresh was cancelled, its lock was unavailable, or its response could not be stored. |
 | `refresh_failed` | A refresh failed during scheduling, transport, upstream handling, or cache persistence. |
-| `invalidated` | A successful grouped mutation replaced the group's generation. |
+| `invalidated` | Direct invalidation or a successful grouped mutation replaced the group's generation. |
 | `failed` | A foreground request or cache operation failed. `operation` identifies the failed operation. |
 
 Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, and `exception`. Unavailable fields are `null`. `toArray()` uses `cache_key` and `group_hash` for log context. Keys and groups are hashed. Records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.

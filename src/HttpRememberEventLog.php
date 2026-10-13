@@ -60,7 +60,7 @@ final readonly class HttpRememberEventLog
     /**
      * Dispatch the event log and optionally write it to the configured log channel.
      *
-     * @param  string  $message  The request method, hostname, and path without credentials, query, or fragment.
+     * @param  string  $message  The request description or a message for direct group invalidation.
      * @param  bool  $warning  Whether this failure uses the warning level even when routine logs are disabled.
      *
      * @internal

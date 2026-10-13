@@ -4,9 +4,11 @@ namespace PhilipAnnis\HttpRemember;
 
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
 use Psr\Http\Message\RequestInterface;
+use Throwable;
 
 /**
  * Register optional configuration and the fluent HTTP remember macro.
@@ -59,13 +61,14 @@ class HttpRememberServiceProvider extends ServiceProvider
         // Register the macro on PendingRequest so every fluent entry point works.
         PendingRequest::macro('remember',
             /**
-             * Remember reads or invalidate a group after successful mutations.
+             * Remember reads or invalidate a group immediately or after successful mutations.
              *
              * @param  int|array{int, int}|null  $ttl  A lifetime, thresholds, or configured default.
              * @param  string|null  $store  A cache store override, or the configured default.
              * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
              * @param  'read'|HttpRememberOperation|null  $operation  Explicit read intent; the internal marker identifies omission.
              * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
+             * @param  bool  $invalidate  Whether to invalidate the supplied group immediately without an HTTP request.
              * @return PendingRequest The same request builder for further chaining.
              *
              * @throws InvalidArgumentException When a cache policy is invalid.
@@ -76,6 +79,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                 ?array $group = null,
                 string|HttpRememberOperation|null $operation = HttpRememberOperation::Automatic,
                 ?callable $cacheWhen = null,
+                bool $invalidate = false,
             ): PendingRequest {
                 /** @var PendingRequest $this */
 
@@ -95,6 +99,28 @@ class HttpRememberServiceProvider extends ServiceProvider
                     config('http-remember.ignored_headers'),
                     config('http-remember.max_response_bytes'),
                 );
+
+                // Require an explicit group instead of treating direct invalidation as a cache-wide flush.
+                if ($invalidate && $settings->groupHash === null) {
+                    throw new InvalidArgumentException('The HTTP remember invalidation group must not be empty.');
+                }
+
+                // Invalidate once when remember is called, independently of later HTTP transfers.
+                if ($invalidate) {
+                    $store = $settings->store ?? config('cache.default');
+
+                    // Keep direct invalidation failures consistent with live mutation failures.
+                    try {
+                        $invalidated = HttpRememberGroup::invalidate(Cache::store($settings->store), $settings->groupHash);
+                        $event = $invalidated ? 'invalidated' : 'failed';
+                        (new HttpRememberEventLog($event, null, $store, $settings->groupHash, operation: 'invalidate'))
+                            ->publish('HTTP remember group invalidation.', ! $invalidated);
+                    } catch (Throwable $exception) {
+                        // Preserve the configured builder while reporting only safe failure metadata.
+                        (new HttpRememberEventLog('failed', null, $store, $settings->groupHash, operation: 'invalidate', exception: $exception::class))
+                            ->publish('HTTP remember group invalidation failed.', true);
+                    }
+                }
 
                 // Replace an earlier policy instead of nesting multiple cache layers.
                 $this->middleware = $this->middleware->reject(
