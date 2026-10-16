@@ -673,8 +673,8 @@ final class CacheLifecycleTest extends TestCase
 
         // Create a repository that permits the read and rejects persistence.
         $cache = Mockery::mock(Repository::class);
-        $cache->shouldReceive('get')->twice()->andReturnNull();
-        $cache->shouldReceive('getStore')->once()->andReturn($store);
+        $cache->shouldReceive('get')->times(3)->andReturnNull();
+        $cache->shouldReceive('getStore')->twice()->andReturn($store);
         $cache->shouldReceive('put')->once()->andThrow(new RuntimeException('Test cache write failure.'));
 
         // Return the controlled repository for this remembered request.

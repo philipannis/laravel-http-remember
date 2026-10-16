@@ -472,7 +472,11 @@ A refresh replaces only the generation it started with. Removing that cache entr
 
 Group invalidation cancels pending refreshes and prevents older in-flight reads or refreshes from populating the replacement group generation. An in-flight request still returns its live result to its own caller. Cache failures during invalidation are logged without replacing the mutation's original response.
 
-When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently. Network requests on cache misses aren't locked, so concurrent misses can make separate API calls, as with `Cache::remember()`. A short, nonblocking lock protects cache writes on stores that support locks. A response that completes later keeps its caller's result without replacing a response another caller has already cached.
+When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently.
+
+Synchronous cache misses use best-effort deduplication on stores with atomic locks. A competing caller waits up to one second, then rechecks the cache. If no usable response is available, it sends its own request, so slow calls can still overlap. Use a shared cache store to coordinate across processes or servers. Async requests, pools, and stores without atomic locks skip miss deduplication.
+
+A short, nonblocking lock separately protects cache writes on stores that support locks. A response that completes later keeps its caller's result without replacing a response another caller has already cached.
 
 Warnings include the hashed cache key when available, plus an HTTP status or exception class where relevant. Their log message includes the method, hostname, and path described in [Event logs](#event-logs). Query strings, credentials, response bodies, and exception messages are omitted.
 
