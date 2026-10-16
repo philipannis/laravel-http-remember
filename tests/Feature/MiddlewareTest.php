@@ -297,8 +297,8 @@ final class MiddlewareTest extends TestCase
 
         // Confirm repeated requests reuse the response even without a lock provider.
         $request = new Request('GET', self::API_URL);
-        self::assertSame('response-body', (string) $handler($request, [])->wait()->getBody());
-        self::assertSame('response-body', (string) $handler($request, [])->wait()->getBody());
+        self::assertSame('response-body', (string) $handler($request, ['synchronous' => true])->wait()->getBody());
+        self::assertSame('response-body', (string) $handler($request, ['synchronous' => true])->wait()->getBody());
         self::assertSame(1, $sent);
     }
 

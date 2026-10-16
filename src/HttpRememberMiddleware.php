@@ -7,6 +7,7 @@ use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
@@ -45,6 +46,16 @@ final class HttpRememberMiddleware
      * Seconds reserved for the generation check and cache write.
      */
     private const WRITE_LOCK_SECONDS = 10;
+
+    /**
+     * Seconds a synchronous cache miss may wait for another caller's response.
+     */
+    private const MISS_LOCK_WAIT_SECONDS = 1;
+
+    /**
+     * Minimum lease for a foreground fetch when its network timeout is unlimited.
+     */
+    private const MISS_LOCK_SECONDS = 30;
 
     /**
      * Create middleware for one immutable request policy.
@@ -113,80 +124,120 @@ final class HttpRememberMiddleware
                     return $this->sendLive($handler, $request, $options, null, $eventLog);
                 }
 
-                // Keep diagnostics and cache-hit state available when a cache read fails.
-                $key = null;
-                $response = null;
-                $reason = 'missing';
-
-                // Treat cache failures as misses without intercepting network exceptions.
+                // Release an acquired miss lock after cache persistence or any foreground failure.
+                $lock = null;
                 try {
-                    // Resolve a group only when this request explicitly selects one.
-                    $cache = Cache::store($this->settings->store);
-                    $group = $this->settings->groupHash === null
-                        ? null
-                        : HttpRememberGroup::resolve($cache, $this->settings->groupHash);
+                    // Keep diagnostics and cache-hit state available when a cache read fails.
+                    $key = null;
+                    $response = null;
+                    $reason = 'missing';
+                    $attemptedLock = false;
 
-                    // Fingerprint the prepared request and its current invalidation generation.
-                    $key = $this->cacheKey($request, $options, $group);
-                    $payload = $cache->get($key);
-                    $cached = HttpRememberResponse::restore($payload);
+                    // Treat cache failures as misses without intercepting network exceptions.
+                    try {
+                        // Resolve a group only when this request explicitly selects one.
+                        $cache = Cache::store($this->settings->store);
+                        $group = $this->settings->groupHash === null
+                            ? null
+                            : HttpRememberGroup::resolve($cache, $this->settings->groupHash);
 
-                    // Describe misses while enforcing hard expiry and current group generations.
-                    if ($cached === null) {
-                        $reason = $payload === null ? 'missing' : 'invalid_entry';
-                    } elseif ($cached->hasReached($this->settings->lifetime)) {
-                        $reason = 'expired';
-                    } elseif ($group !== null && ! $group->isCurrent()) {
-                        $reason = 'group_invalidated';
-                    } else {
-                        // Reconstruct the response before inspecting its declared header dependencies.
-                        $candidate = $cached->toResponse();
+                        // Fingerprint the prepared request and its current invalidation generation.
+                        $key = $this->cacheKey($request, $options, $group);
 
-                        // Recheck entries stored before the ignored-header configuration changed.
-                        if (! $this->variesOnIgnoredHeaders($candidate)) {
-                            $response = $candidate;
-                        } else {
-                            $reason = 'vary';
-                        }
+                        // Recheck once after waiting so another worker's response avoids a live fetch.
+                        do {
+                            $payload = $cache->get($key);
+                            $cached = HttpRememberResponse::restore($payload);
+
+                            // Describe misses while enforcing hard expiry and current group generations.
+                            if ($cached === null) {
+                                $reason = $payload === null ? 'missing' : 'invalid_entry';
+                            } elseif ($cached->hasReached($this->settings->lifetime)) {
+                                $reason = 'expired';
+                            } elseif ($group !== null && ! $group->isCurrent()) {
+                                $reason = 'group_invalidated';
+                            } else {
+                                // Reconstruct the response before inspecting its declared header dependencies.
+                                $candidate = $cached->toResponse();
+
+                                // Recheck entries stored before the ignored-header configuration changed.
+                                if (! $this->variesOnIgnoredHeaders($candidate)) {
+                                    $response = $candidate;
+                                } else {
+                                    $reason = 'vary';
+                                }
+                            }
+
+                            // Keep hits, asynchronous requests, and stores without locks free from blocking waits.
+                            if ($response !== null || $attemptedLock || ! ($options['synchronous'] ?? false)
+                                || ! (($cacheStore = $cache->getStore()) instanceof LockProvider)) {
+                                break;
+                            }
+
+                            // Bound the wait independently of the lease covering the network request and write.
+                            $attemptedLock = true;
+                            try {
+                                $seconds = max(self::MISS_LOCK_SECONDS, (int) ceil($options['timeout'] ?? 0) + self::WRITE_LOCK_SECONDS);
+                                $candidateLock = $cacheStore->lock($key.':miss', $seconds);
+                                $candidateLock->block(self::MISS_LOCK_WAIT_SECONDS);
+                                $lock = $candidateLock;
+                            } catch (LockTimeoutException) {
+                                // Make one final cache check before falling back to an independent live request.
+                            } catch (Throwable $exception) {
+                                // Preserve ordinary HTTP behavior when the cache cannot coordinate misses.
+                                $this->logFailure('lock', $key, ['exception' => $exception::class], $eventLog);
+                            }
+                        } while (true);
+                    } catch (Throwable $exception) {
+                        // Report the cache failure without exposing the exception message.
+                        $this->logFailure('read', $key, ['exception' => $exception::class], $eventLog);
+                        $eventLog('bypass', $key, ['reason' => 'cache_read_failed']);
+
+                        // Let the live request retain Laravel's normal error handling.
+                        return $this->sendLive($handler, $request, $options, $key, $eventLog);
                     }
-                } catch (Throwable $exception) {
-                    // Report the cache failure without exposing the exception message.
-                    $this->logFailure('read', $key, ['exception' => $exception::class], $eventLog);
-                    $eventLog('bypass', $key, ['reason' => 'cache_read_failed']);
 
-                    // Let the live request retain Laravel's normal error handling.
-                    return $this->sendLive($handler, $request, $options, $key, $eventLog);
-                }
+                    // Keep application event failures outside cache failure handling.
+                    if ($response !== null) {
+                        // Identify stale cache hits before scheduling their deferred refresh.
+                        $stale = $cached->hasReached($this->settings->fresh);
 
-                // Keep application event failures outside cache failure handling.
-                if ($response !== null) {
-                    // Identify stale cache hits before scheduling their deferred refresh.
-                    $stale = $cached->hasReached($this->settings->fresh);
+                        // Restore Laravel's request metadata and events for the cached response.
+                        $onHit($request, $options);
+                        $eventLog('hit', $key, ['reason' => $stale ? 'stale' : 'fresh', 'age' => $cached->age(), 'status' => $response->getStatusCode()]);
 
-                    // Restore Laravel's request metadata and events for the cached response.
-                    $onHit($request, $options);
-                    $eventLog('hit', $key, ['reason' => $stale ? 'stale' : 'fresh', 'age' => $cached->age(), 'status' => $response->getStatusCode()]);
+                        // Keep a usable stale response even if refresh scheduling fails.
+                        if ($stale) {
+                            // Contain scheduling failures while preserving the cache hit.
+                            try {
+                                // Defer a refresh of the generation served to this caller.
+                                $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group, $eventLog);
+                            } catch (Throwable $exception) {
+                                // Report the scheduling failure using safe exception metadata.
+                                $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
+                            }
+                        }
 
-                    // Keep a usable stale response even if refresh scheduling fails.
-                    if ($stale) {
-                        // Contain scheduling failures while preserving the cache hit.
+                        // Give each cache hit an independent fulfilled response promise.
+                        return Create::promiseFor($response);
+                    }
+
+                    // Populate an absent or expired entry only after an eligible response.
+                    $eventLog('miss', $key, ['reason' => $reason]);
+                    $promise = $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, null, $group);
+
+                    // Complete synchronous persistence before releasing the miss lock to another worker.
+                    return $lock === null ? $promise : Create::promiseFor($promise->wait());
+                } finally {
+                    // A release failure must not replace a usable response or the original network exception.
+                    if ($lock !== null) {
                         try {
-                            // Defer a refresh of the generation served to this caller.
-                            $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group, $eventLog);
+                            $lock->release();
                         } catch (Throwable $exception) {
-                            // Report the scheduling failure using safe exception metadata.
-                            $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
+                            $this->logFailure('lock', $key, ['exception' => $exception::class], $eventLog);
                         }
                     }
-
-                    // Give each cache hit an independent fulfilled response promise.
-                    return Create::promiseFor($response);
                 }
-
-                // Populate an absent or expired entry only after an eligible response.
-                $eventLog('miss', $key, ['reason' => $reason]);
-
-                return $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, null, $group);
             };
     }
 
