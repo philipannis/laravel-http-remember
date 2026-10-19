@@ -350,7 +350,6 @@ final class CacheLifecycleTest extends TestCase
         Http::fakeSequence()
             ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK)
             ->push(['error' => 'Unavailable'], HttpStatus::HTTP_SERVICE_UNAVAILABLE)
-            ->push(['error' => 'Unavailable'], HttpStatus::HTTP_SERVICE_UNAVAILABLE)
             ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK);
 
         // Populate the initial response and move it into the stale period.
@@ -368,15 +367,15 @@ final class CacheLifecycleTest extends TestCase
         self::assertSame(self::INITIAL_VERSION, $beforeRefresh->json('version'));
         self::assertSame(self::INITIAL_VERSION, $afterRefresh->json('version'));
 
-        // Complete the newly scheduled callback to keep the test lifecycle isolated.
-        app(DeferredCallbackCollection::class)->invoke();
-        Http::assertSentCount(3);
+        // The failed generation cannot schedule another refresh during its cooldown.
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(2);
 
         // Retaining the failed generation must not extend the response's original lifetime.
         Carbon::setTestNow($startedAt->copy()->addSeconds(self::LIFETIME_SECONDS));
         $expired = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
         self::assertSame(self::UPDATED_VERSION, $expired->json('version'));
-        Http::assertSentCount(4);
+        Http::assertSentCount(3);
     }
 
     /**

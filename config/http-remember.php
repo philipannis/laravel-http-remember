@@ -5,7 +5,7 @@
  * Choose a fixed lifetime or [fresh, total lifetime] thresholds.
  * Durations are measured in seconds. Sizes are measured in bytes.
  *
- * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, max_response_bytes: int, ignored_headers: list<string>, event_logs: array{enabled: bool, channel: string|null}}
+ * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, refresh_cooldown: int, max_response_bytes: int, ignored_headers: list<string>, event_logs: array{enabled: bool, channel: string|null}}
  */
 return [
 
@@ -15,8 +15,11 @@ return [
     // Use the application's default cache store unless a name is supplied.
     'store' => null,
 
-    // Limit deferred refreshes to 15 seconds; preserve shorter request timeouts.
+    // Limit deferred refreshes to 15 seconds while preserving shorter request timeouts.
     'refresh_timeout' => 15,
+
+    // Wait at least 15 seconds after failed refreshes, honoring longer retry-after delays.
+    'refresh_cooldown' => 15,
 
     // Cache response bodies up to 1 MB.
     'max_response_bytes' => 1_000_000,

@@ -126,7 +126,7 @@ final class IgnoredHeadersTest extends TestCase
     }
 
     /**
-     * Confirm an empty list restores request-ID-sensitive cache identity.
+     * Confirm an empty list restores request-id-sensitive cache identity.
      */
     public function test_empty_configuration_includes_all_request_headers(): void
     {

@@ -74,7 +74,7 @@ final class HttpRememberResponse
 
         // Restore the cursor even when reading the response body fails.
         try {
-            // Bound capture even when the stream size or Content-Length is unavailable or inaccurate.
+            // Bound capture even when the stream size or content-length is unavailable or inaccurate.
             $stream->rewind();
             $body = Utils::copyToString(new LimitStream($stream, $maxResponseBytes));
 

@@ -149,10 +149,11 @@ final class ResponseEligibilityTest extends TestCase
                 /**
                  * Check that warnings retain event context without leaking private exception details.
                  */
-                static fn (array $context): bool => count($context) === 9
+                static fn (array $context): bool => count($context) === 10
                     && preg_match('/^http-remember:[a-f0-9]{64}$/', $context['cache_key']) === 1
                     && $context['event'] === 'failed'
                     && $context['operation'] === 'eligibility'
+                    && $context['retry_at'] === null
                     && $context['exception'] === $exception,
             ),
         );

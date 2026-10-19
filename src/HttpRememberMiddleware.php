@@ -3,6 +3,8 @@
 namespace PhilipAnnis\HttpRemember;
 
 use Closure;
+use DateTimeImmutable;
+use DateTimeZone;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Utils;
@@ -12,6 +14,7 @@ use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Http\Response as HttpStatus;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
@@ -649,6 +652,14 @@ final class HttpRememberMiddleware
         ?HttpRememberGroup $group,
         Closure $eventLog,
     ): void {
+        // Scope cooldowns to the original generation so replacements start without old failures.
+        $cooldownKey = $key.':refresh-cooldown:'.$generation->id();
+        if (($retryAt = $this->refreshRetryAt($cache, $cooldownKey)) !== null) {
+            $eventLog('refresh_skipped', $key, ['reason' => 'cooldown', 'retry_at' => $retryAt]);
+
+            return;
+        }
+
         // Retain the original stream while preparing an independent deferred request.
         $body = $request->getBody();
 
@@ -690,7 +701,7 @@ final class HttpRememberMiddleware
              *
              * @return void
              */
-            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog): void {
+            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey): void {
                 // Contain refresh failures after the caller has received its response.
                 try {
                     // Recheck the generation after acquiring any available refresh lock.
@@ -700,7 +711,7 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog): void {
+                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey): void {
                             // Skip expired responses and groups invalidated before deferred execution.
                             $reason = match (true) {
                                 $generation->hasReached($this->settings->lifetime) => 'expired',
@@ -715,14 +726,29 @@ final class HttpRememberMiddleware
                                 return;
                             }
 
+                            // Recheck under the refresh lock in case another worker has just failed.
+                            if (($retryAt = $this->refreshRetryAt($cache, $cooldownKey)) !== null) {
+                                $eventLog('refresh_skipped', $key, ['reason' => 'cooldown', 'retry_at' => $retryAt]);
+
+                                return;
+                            }
+
                             // Record actual refresh work after every cancellation check passes.
                             $eventLog('refresh_started', $key, ['age' => $generation->age()]);
 
                             // Wait only during deferred execution, never while serving stale data.
-                            $response = $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, $generation, $group)->wait();
+                            try {
+                                $response = $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, $generation, $group)->wait();
+                            } catch (Throwable $exception) {
+                                // Persist the cooldown before releasing the lock without masking the transport error.
+                                $this->coolDownRefresh($cache, $key, $cooldownKey, $generation, $eventLog);
+
+                                throw $exception;
+                            }
 
                             // Log unsuccessful refreshes while retaining the original expiry.
                             if ($response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_MULTIPLE_CHOICES) {
+                                $this->coolDownRefresh($cache, $key, $cooldownKey, $generation, $eventLog, $response);
                                 $this->logFailure('refresh', $key, ['status' => $response->getStatusCode()], $eventLog);
                             }
                         };
@@ -750,6 +776,70 @@ final class HttpRememberMiddleware
 
         // Each stale hit requests scheduling; Laravel deduplicates execution by callback name.
         $eventLog('refresh_scheduled', $key, ['age' => $generation->age()]);
+    }
+
+    /**
+     * Read an active cooldown without relying on the store's eviction timing.
+     *
+     * @param  Repository  $cache  The response's selected cache repository.
+     * @param  string  $cooldownKey  The cooldown key for this response generation.
+     * @return float|null The next permitted refresh timestamp, or null when no cooldown applies.
+     */
+    private function refreshRetryAt(Repository $cache, string $cooldownKey): ?float
+    {
+        // Treat malformed or elapsed metadata as permission to try refreshing again.
+        $retryAt = $cache->get($cooldownKey);
+
+        return (is_int($retryAt) || is_float($retryAt)) && is_finite($retryAt)
+            && $retryAt > Carbon::now()->getPreciseTimestamp() / 1000000 ? (float) $retryAt : null;
+    }
+
+    /**
+     * Retain a failed generation's cooldown without extending its response lifetime.
+     *
+     * @param  Repository  $cache  The response's selected cache repository.
+     * @param  string  $key  The hashed response cache key used for diagnostics.
+     * @param  string  $cooldownKey  The cooldown key for this response generation.
+     * @param  HttpRememberResponse  $generation  The response whose refresh failed.
+     * @param  EventLogger  $eventLog  The publisher bound to the failed refresh.
+     * @param  ResponseInterface|null  $response  The failed response, when the transport completed.
+     */
+    private function coolDownRefresh(Repository $cache, string $key, string $cooldownKey, HttpRememberResponse $generation, Closure $eventLog, ?ResponseInterface $response = null): void
+    {
+        // A metadata failure must not replace the original refresh outcome.
+        try {
+            $now = Carbon::now()->getPreciseTimestamp() / 1000000;
+            $delay = $this->settings->refreshCooldown;
+            $retryAfter = trim($response?->getHeaderLine('Retry-After') ?? '');
+
+            // Accept non-negative integer seconds without overflowing on very large values.
+            if (ctype_digit($retryAfter)) {
+                $delay = max($delay, (float) $retryAfter);
+            } elseif ($retryAfter !== '') {
+                // Support HTTP dates, including the two obsolete formats accepted by HTTP recipients.
+                foreach ([DATE_RFC7231, 'l, d-M-y H:i:s \\G\\M\\T', 'D M j H:i:s Y'] as $format) {
+                    $date = DateTimeImmutable::createFromFormat('!'.$format, $retryAfter, new DateTimeZone('UTC'));
+                    if ($date !== false && DateTimeImmutable::getLastErrors() === false) {
+                        $delay = max($delay, $date->getTimestamp() - $now);
+
+                        break;
+                    }
+                }
+            }
+
+            // Cap the deadline at hard expiry even when the server requests a longer delay.
+            $delay = min($delay, $this->settings->lifetime - $generation->age());
+            if ($delay <= 0) {
+                return;
+            }
+
+            // Store only a deadline, leaving the response and its original expiry untouched.
+            if (! $cache->put($cooldownKey, $now + $delay, (int) ceil($delay))) {
+                throw new RuntimeException('The HTTP remember refresh cooldown could not be stored.');
+            }
+        } catch (Throwable $exception) {
+            $this->logFailure('cooldown', $key, ['exception' => $exception::class], $eventLog);
+        }
     }
 
     /**
@@ -829,6 +919,7 @@ final class HttpRememberMiddleware
                     $context['status'] ?? null,
                     $context['operation'] ?? null,
                     $context['exception'] ?? null,
+                    $context['retry_at'] ?? null,
                 ))->publish($message, $warning);
             };
     }
