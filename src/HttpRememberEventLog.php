@@ -84,6 +84,17 @@ final readonly class HttpRememberEventLog
 
         // Keep the skimmable request message and structured context separate for Laravel's normal log format.
         try {
+            // Redact only emitted records, including warnings when routine logging is disabled.
+            $redact = config('http-remember.event_logs.redact');
+            if ($redact !== null) {
+                $message = $redact($message);
+
+                // Never fall back to the original message when redaction fails its contract.
+                if (! is_string($message)) {
+                    return;
+                }
+            }
+
             $logger = Log::channel(config('http-remember.event_logs.channel'));
             if ($warning) {
                 $logger->warning($message, $this->toArray());
@@ -91,7 +102,7 @@ final readonly class HttpRememberEventLog
                 $logger->debug($message, $this->toArray());
             }
         } catch (Throwable) {
-            // A logging outage must not alter the response or its cache lifetime.
+            // Redaction or logging failures must not expose the message or alter the response.
         }
     }
 }

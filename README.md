@@ -298,6 +298,7 @@ return [
     'event_logs' => [
         'enabled' => in_array(env('APP_ENV', 'production'), ['local', 'development', 'dev'], true),
         'channel' => 'http-remember',
+        'redact' => null,
     ],
 
     // Ignore common tracing and correlation headers when generating cache keys.
@@ -323,6 +324,7 @@ return [
 - `max_response_bytes` must be a positive integer and defaults to **1 MB (1,000,000 bytes)**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible. Larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
 - `event_logs.enabled` defaults to `true` when `APP_ENV` is `local`, `development`, or `dev`, and `false` otherwise. Set it explicitly to enable or disable event log output in any environment. Laravel listeners still receive event logs when file output is disabled.
 - `event_logs.channel` defaults to `'http-remember'`. The package supplies a daily log at `storage/logs/http-remember-YYYY-MM-DD.log`, with a `debug` level and 7 days of retention. Define `logging.channels.http-remember` to customize that channel, choose another configured channel, or use `null` for the application's default. Existing cache failure warnings use the selected channel even when routine event log output is disabled.
+- `event_logs.redact` defaults to `null`. Set a `callable(string): string` to mask sensitive values in log messages; see [Redact log messages](#redact-log-messages).
 - `ignored_headers` is a positional list of valid HTTP header names excluded from cache keys. The defaults cover common tracing and correlation headers, so changing a request ID does not create another cache entry. Names match case-insensitively and duplicates are removed. Blank names, names containing whitespace, associative arrays, and non-string values are rejected immediately. Replace the list to customize it, or set it to `[]` to include all request headers. Headers are still sent upstream normally.
 
 Calling `remember()` without arguments uses these defaults. Passing a lifetime or store overrides that setting for one request.
@@ -408,6 +410,32 @@ Event logs use Laravel's standard log format. The message shows `[METHOD] hostna
 Failure warnings use the same request message and structured context at the `warning` level. They remain enabled when routine event log output is disabled, and a failed operation produces one warning rather than duplicate debug and warning records. Application channel overrides retain their own formatting.
 
 Direct group invalidation uses the message `HTTP remember group invalidation.` or `HTTP remember group invalidation failed.` with the selected store, hashed group, and `operation: 'invalidate'`. Its request key and HTTP status are `null` because it sends no HTTP request.
+
+### Redact log messages
+
+Set `event_logs.redact` when your API puts sensitive values in URL paths. The callback receives the existing log message, such as `[GET] api.example.com/tokens/secret`, and returns the masked message. Query strings, URL credentials, and fragments have already been omitted.
+
+For example, add a static method to your application:
+
+```php
+namespace App\Support;
+
+final class HttpLogRedactor
+{
+    public static function redact(string $message): string
+    {
+        return preg_replace('~(/tokens/)[^/\s]+~', '$1[redacted]', $message);
+    }
+}
+```
+
+Then set this entry inside `event_logs` in `config/http-remember.php`:
+
+```php
+'redact' => [App\Support\HttpLogRedactor::class, 'redact'],
+```
+
+Static callable arrays work with Laravel's cached configuration. Closures can also be supplied programmatically. The callback runs only for records being written, including failure warnings, and also receives direct group invalidation messages. It changes only the log message; requests, cache keys, and structured event context remain unchanged. If it throws, is not callable, or returns a non-string value, that log record is skipped without logging the original message. Event listeners still receive the structured event.
 
 ### Listen for event logs
 
