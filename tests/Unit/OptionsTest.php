@@ -47,6 +47,7 @@ final class OptionsTest extends TestCase
         self::assertNull($options->operation);
         self::assertNull($options->cacheWhen);
         self::assertSame(self::REFRESH_TIMEOUT_SECONDS, $options->refreshTimeout);
+        self::assertSame(15, $options->refreshCooldown);
         self::assertSame(1_000_000, $options->maxResponseBytes);
     }
 
@@ -135,6 +136,17 @@ final class OptionsTest extends TestCase
 
         // Attempt to create a policy with no usable refresh timeout.
         new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, null, 0);
+    }
+
+    /**
+     * Confirm non-positive cooldowns are rejected before attaching middleware.
+     */
+    public function test_invalid_refresh_cooldown_is_rejected(): void
+    {
+        // Require a positive duration just like the deferred network timeout.
+        $this->expectException(InvalidArgumentException::class);
+
+        new HttpRememberOptions(self::FIXED_LIFETIME_SECONDS, null, self::REFRESH_TIMEOUT_SECONDS, refreshCooldown: 0);
     }
 
     /**

@@ -98,6 +98,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                     $cacheWhen,
                     config('http-remember.ignored_headers'),
                     config('http-remember.max_response_bytes'),
+                    config('http-remember.refresh_cooldown'),
                 );
 
                 // Require an explicit group instead of treating direct invalidation as a cache-wide flush.

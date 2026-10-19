@@ -205,7 +205,7 @@ $products = Http::remember(600, group: ['tenant:42', 'products'], invalidate: tr
 
 Reusing that builder keeps ordinary caching behavior. It does not invalidate again on each request. Call `remember(..., invalidate: true)` again when the group changes.
 
-`invalidate` defaults to `false`. Direct invalidation requires a non-empty `group`; omitting it, passing `null`, or passing an empty list throws `InvalidArgumentException`. The same group validation, exact matching, and store defaults apply. Cache failures are logged through the existing `failed` event with `operation: 'invalidate'` and preserve the usual builder return value.
+`invalidate` defaults to `false`. Direct invalidation requires a non-empty `group`. Omitting it, passing `null`, or passing an empty list throws `InvalidArgumentException`. The same group validation, exact matching, and store defaults apply. Cache failures are logged through the existing `failed` event with `operation: 'invalidate'` and preserve the usual builder return value.
 
 ### Cache POST searches and other reads
 
@@ -277,27 +277,30 @@ php artisan vendor:publish --tag=http-remember-config
 ### 2. Edit `config/http-remember.php`
 
 ```php
-// Set defaults for remembered requests. All durations are in seconds.
 return [
-    // Keep responses fresh for 30 minutes and cached for 60 minutes in total.
+
+    // Use 3600 for fixed expiry or [1800, 3600] for stale-while-revalidate.
     'ttl' => [1800, 3600],
 
-    // Use the application's default cache store.
+    // Use the application's default cache store unless a name is supplied.
     'store' => null,
 
-    // Limit network timeouts during deferred refreshes to 15 seconds.
+    // Limit deferred refreshes to 15 seconds while preserving shorter request timeouts.
     'refresh_timeout' => 15,
+
+    // Wait at least 15 seconds after failed refreshes, honoring longer retry-after delays.
+    'refresh_cooldown' => 15,
 
     // Cache response bodies up to 1 MB.
     'max_response_bytes' => 1_000_000,
 
-    // Enable event logs during development and use the dedicated package log.
+    // Enable event logs during development and keep them in the package's dedicated log channel.
     'event_logs' => [
         'enabled' => in_array(env('APP_ENV', 'production'), ['local', 'development', 'dev'], true),
         'channel' => 'http-remember',
     ],
 
-    // Exclude common tracing and correlation headers from cache keys.
+    // Ignore common tracing and correlation headers when generating cache keys.
     'ignored_headers' => [
         'traceparent',
         'tracestate',
@@ -309,12 +312,14 @@ return [
         'x-cloud-trace-context',
         'x-amzn-trace-id',
     ],
+
 ];
 ```
 
 - `ttl` accepts the same values as `remember()`: use `3600` for a fixed hour, or `[1800, 3600]` for the default fresh/stale behavior.
 - `store` is a configured cache store name. Leave it `null` to use your application's default, or set it to `'redis'` to use Redis.
 - `refresh_timeout` must be a positive integer. It caps Guzzle's `timeout`, `connect_timeout`, and `read_timeout` options for deferred refreshes only. Shorter timeouts stay unchanged. Unlimited or longer timeouts use this cap. It doesn't change timeouts for requests that callers wait for.
+- `refresh_cooldown` must be a positive integer and defaults to **15 seconds**. Failed deferred HTTP responses and transport exceptions pause later refreshes for at least this long. A valid `Retry-After` can lengthen that delay. Foreground requests and the original response lifetime stay unchanged.
 - `max_response_bytes` must be a positive integer and defaults to **1 MB (1,000,000 bytes)**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible. Larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
 - `event_logs.enabled` defaults to `true` when `APP_ENV` is `local`, `development`, or `dev`, and `false` otherwise. Set it explicitly to enable or disable event log output in any environment. Laravel listeners still receive event logs when file output is disabled.
 - `event_logs.channel` defaults to `'http-remember'`. The package supplies a daily log at `storage/logs/http-remember-YYYY-MM-DD.log`, with a `debug` level and 7 days of retention. Define `logging.channels.http-remember` to customize that channel, choose another configured channel, or use `null` for the application's default. Existing cache failure warnings use the selected channel even when routine event log output is disabled.
@@ -340,7 +345,7 @@ Keys use the `http-remember:` prefix followed by a SHA-256 hash of the method, U
 
 The transport options included in the key are `auth`, `cert`, `ssl_key`, `verify`, `decode_content`, and `proxy`. Network timeouts and delays don't create separate cache entries.
 
-Header names and their ordering are normalized. Included header values, body bytes, and query ordering stay as sent. Equivalent query strings or JSON bodies with different ordering can therefore create distinct entries. The default exclusions preserve separate entries for different bearer tokens, basic credentials, cookie headers, bodies, or lifetimes. URLs and credentials aren't written into keys as plaintext.
+Header names and their ordering are normalized. Included header values, body bytes, and query ordering stay as sent. Equivalent query strings or JSON bodies with different ordering can therefore create distinct entries. The default exclusions preserve separate entries for different bearer tokens, basic credentials, `Cookie` headers, bodies, or lifetimes. URLs and credentials aren't written into keys as plaintext.
 
 Only exclude headers that do not affect the response data. Authentication, tenant, language, API-version, and idempotency headers remain in the key by default. Responses with `Vary: *` or a `Vary` field naming an ignored header are returned live without being cached or reused, because their variants cannot be distinguished by the filtered key. Other `Vary` headers remain cacheable because their request headers are still included.
 
@@ -397,7 +402,7 @@ Event logs describe cache decisions and refresh outcomes. They are written to th
 Event logs use Laravel's standard log format. The message shows `[METHOD] hostname/path`, with the scheme, leading `www.`, port, credentials, query parameters, and fragment omitted for quick skimming. The request path keeps its original case and encoding. A request without a path shows `/`. The event type and all other fields are passed as a separate context array. The dedicated channel uses Laravel's normal formatter:
 
 ```text
-[2026-01-01 12:00:10] local.DEBUG: [GET] api.example.com/products {"event":"hit","cache_key":"http-remember:...","store":"redis","group_hash":null,"reason":"stale","age":10.0,"status":200,"operation":null,"exception":null}
+[2026-01-01 12:00:10] local.DEBUG: [GET] api.example.com/products {"event":"hit","cache_key":"http-remember:...","store":"redis","group_hash":null,"reason":"stale","age":10.0,"status":200,"operation":null,"exception":null,"retry_at":null}
 ```
 
 Failure warnings use the same request message and structured context at the `warning` level. They remain enabled when routine event log output is disabled, and a failed operation produces one warning rather than duplicate debug and warning records. Application channel overrides retain their own formatting.
@@ -430,16 +435,16 @@ Event::listen(HttpRememberEventLog::class, function (HttpRememberEventLog $event
 | `refresh_scheduled` | A stale hit requested deferred work. |
 | `refresh_started` | Deferred work passed its generation checks and is about to contact the API. |
 | `refresh_succeeded` | A deferred refresh stored its replacement response. |
-| `refresh_skipped` | A refresh was cancelled, its lock was unavailable, or its response could not be stored. |
+| `refresh_skipped` | A refresh was cancelled, its cooldown was active, its lock was unavailable, or its response could not be stored. |
 | `refresh_failed` | A refresh failed during scheduling, transport, upstream handling, or cache persistence. |
 | `invalidated` | Direct invalidation or a successful grouped mutation replaced the group's generation. |
 | `failed` | A foreground request or cache operation failed. `operation` identifies the failed operation. |
 
-Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, and `exception`. Unavailable fields are `null`. `toArray()` uses `cache_key` and `group_hash` for log context. Keys and groups are hashed. Records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.
+Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, `exception`, and `retryAt`. Unavailable fields are `null`. Cooldown skips include `retryAt` as the next permitted refresh's Unix timestamp. `toArray()` uses `cache_key`, `group_hash`, and `retry_at` for log context. Keys and groups are hashed. Records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.
 
-Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, or `refresh_lock_unavailable`.
+Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `refresh_lock_unavailable`, or `cooldown`.
 
-Every stale hit emits `refresh_scheduled`, while Laravel deduplicates actual execution by callback name. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
+Stale hits outside cooldown emit `refresh_scheduled`, while Laravel deduplicates actual execution by callback name. Hits during cooldown emit `refresh_skipped` instead. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
 
 ## Refreshes and failures
 
@@ -463,6 +468,16 @@ Refreshes replay the prepared request from the stale hit with an independent cop
 | A cache read or write fails | Let the live request proceed and log the cache failure. |
 
 Refreshes make one attempt through the remaining Guzzle handler stack. `retry()` still applies to foreground requests. Deferred refreshes don't repeat that outer retry loop. Failed refreshes never extend the stale period.
+
+### Refresh cooldowns
+
+A deferred refresh that returns a non-2xx response or throws a transport exception starts a fixed cooldown. The default is 15 seconds, configured by `refresh_cooldown`. Stale callers keep receiving the existing response, but they do not schedule another refresh until the cooldown ends. A later stale request triggers the next attempt without sleeps or automatic retries.
+
+For failed HTTP responses, `Retry-After` can extend the cooldown beyond the configured minimum. Both non-negative integer seconds and HTTP dates are supported. Missing, malformed, negative, or past values use the configured minimum. Predicate rejections, oversized responses, lock contention, and invalidation do not start cooldowns.
+
+Cooldowns live in the selected cache store and belong to one response generation. Replacement responses and invalidated groups do not inherit earlier failures. Stores with atomic locks recheck the deadline under the existing refresh lock, so callbacks already queued by another worker also respect the cooldown. Stores without locks share deadlines but cannot coordinate simultaneous attempts. Cooldown metadata failures are contained and reported through the existing event logs.
+
+Cooldowns never extend the response's lifetime. Their deadlines are capped at the original hard expiry, and their metadata expires automatically. After hard expiry, requests fetch live data normally even if the server requested a longer wait. Foreground errors retain their normal responses or exceptions. Expired cached responses are never used as a fallback.
 
 ### Expiry and concurrent requests
 

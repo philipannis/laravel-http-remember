@@ -23,6 +23,7 @@ final readonly class HttpRememberEventLog
      * @param  int|null  $status  The upstream or remembered HTTP status, when available.
      * @param  string|null  $operation  The cache operation associated with a failure.
      * @param  class-string<Throwable>|null  $exception  The exception class, without its message.
+     * @param  float|null  $retryAt  The next permitted refresh time as a Unix timestamp, when cooling down.
      */
     public function __construct(
         public string $event,
@@ -34,12 +35,13 @@ final readonly class HttpRememberEventLog
         public ?int $status = null,
         public ?string $operation = null,
         public ?string $exception = null,
+        public ?float $retryAt = null,
     ) {}
 
     /**
      * Return the structured event log context used by Laravel's logger.
      *
-     * @return array{event: string, cache_key: string|null, store: string|null, group_hash: string|null, reason: string|null, age: float|null, status: int|null, operation: string|null, exception: string|null}
+     * @return array{event: string, cache_key: string|null, store: string|null, group_hash: string|null, reason: string|null, age: float|null, status: int|null, operation: string|null, exception: string|null, retry_at: float|null}
      */
     public function toArray(): array
     {
@@ -54,6 +56,7 @@ final readonly class HttpRememberEventLog
             'status' => $this->status,
             'operation' => $this->operation,
             'exception' => $this->exception,
+            'retry_at' => $this->retryAt,
         ];
     }
 

@@ -135,7 +135,7 @@ final class ResponseTest extends TestCase
     /**
      * Provide cookie header names with case variations used by HTTP responses.
      *
-     * @return iterable<string, array{string}> Cookie header names keyed by casing.
+     * @return iterable<string, array{string}> The cookie header names keyed by casing.
      */
     public static function cookieHeaderNames(): iterable
     {
@@ -194,7 +194,7 @@ final class ResponseTest extends TestCase
     #[DataProvider('responseSizeBoundaries')]
     public function test_capture_bounds_reads_and_preserves_the_live_body(int $bodyBytes, ?int $reportedSize): void
     {
-        // Advertise a misleading Content-Length independently of the stream's actual bytes.
+        // Advertise a misleading content-length independently of the stream's actual bytes.
         $contents = str_repeat('x', $bodyBytes);
         $body = Utils::streamFor($contents);
         $position = min(4, $bodyBytes);

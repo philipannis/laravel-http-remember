@@ -72,6 +72,7 @@ final readonly class HttpRememberOptions
      * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
      * @param  list<string>  $ignoredHeaders  Request header names excluded from cache fingerprints.
      * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
+     * @param  int  $refreshCooldown  The minimum delay after a failed deferred refresh in seconds.
      *
      * @throws InvalidArgumentException When a duration, cache store, group, operation, header name, or response size is invalid.
      */
@@ -84,6 +85,7 @@ final readonly class HttpRememberOptions
         ?callable $cacheWhen = null,
         array $ignoredHeaders = [],
         public int $maxResponseBytes = self::DEFAULT_MAX_RESPONSE_BYTES,
+        public int $refreshCooldown = 15,
     ) {
         // Keep every supported callable in an immutable closure without rebinding its scope.
         $this->cacheWhen = $cacheWhen === null ? null : Closure::fromCallable($cacheWhen);
@@ -91,6 +93,11 @@ final readonly class HttpRememberOptions
         // Require a positive timeout for deferred network work.
         if ($refreshTimeout <= 0) {
             throw new InvalidArgumentException('The HTTP remember refresh timeout must be a positive number of seconds.');
+        }
+
+        // Require a positive cooldown without changing foreground request behavior.
+        if ($refreshCooldown <= 0) {
+            throw new InvalidArgumentException('The HTTP remember refresh cooldown must be a positive number of seconds.');
         }
 
         // Require a bounded response budget instead of silently allowing unlimited buffering.
