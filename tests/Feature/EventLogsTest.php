@@ -458,6 +458,7 @@ final class EventLogsTest extends TestCase
         $defaults = require __DIR__.'/../../config/http-remember.php';
         self::assertFalse($defaults['event_logs']['enabled']);
         self::assertSame('http-remember', $defaults['event_logs']['channel']);
+        self::assertNull($defaults['event_logs']['redact']);
         self::assertSame('daily', config('logging.channels.http-remember.driver'));
         self::assertSame(storage_path('logs/http-remember.log'), config('logging.channels.http-remember.path'));
         self::assertSame(7, config('logging.channels.http-remember.days'));

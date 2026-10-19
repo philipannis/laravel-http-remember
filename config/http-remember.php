@@ -5,7 +5,7 @@
  * Choose a fixed lifetime or [fresh, total lifetime] thresholds.
  * Durations are measured in seconds. Sizes are measured in bytes.
  *
- * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, refresh_cooldown: int, max_response_bytes: int, ignored_headers: list<string>, event_logs: array{enabled: bool, channel: string|null}}
+ * @return array{ttl: int|array{int, int}, store: string|null, refresh_timeout: int, refresh_cooldown: int, max_response_bytes: int, ignored_headers: list<string>, event_logs: array{enabled: bool, channel: string|null, redact: (callable(string): string)|null}}
  */
 return [
 
@@ -28,6 +28,7 @@ return [
     'event_logs' => [
         'enabled' => in_array(env('APP_ENV', 'production'), ['local', 'development', 'dev'], true),
         'channel' => 'http-remember',
+        'redact' => null,
     ],
 
     // Ignore common tracing and correlation headers when generating cache keys.
