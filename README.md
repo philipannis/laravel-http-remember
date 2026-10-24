@@ -1,7 +1,7 @@
 # Laravel HTTP Remember
 
-![PHP](https://img.shields.io/badge/PHP-8.2%2B-777BB4?style=flat-square)
-![Laravel](https://img.shields.io/badge/Laravel-12%20%7C%2013-FF2D20?style=flat-square)
+![PHP](https://img.shields.io/badge/PHP-8.2%E2%80%938.5-777BB4?style=flat-square)
+![Laravel](https://img.shields.io/badge/Laravel-12%E2%80%9313-FF2D20?style=flat-square)
 [![License](https://img.shields.io/badge/license-MIT-334155?style=flat-square)](LICENSE)
 
 Add `remember()` to Laravel's HTTP client to cache successful API responses. It handles cache keys, response storage, and refreshes using your application's cache store. Use `group` to invalidate related cached reads after a live mutation or with `invalidate: true`. Requests without `remember()` skip the package entirely.

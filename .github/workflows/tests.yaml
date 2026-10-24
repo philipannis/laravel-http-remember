@@ -19,6 +19,21 @@ jobs:
             laravel: '12'
             testbench: '10'
           - php: '8.3'
+            laravel: '12'
+            testbench: '10'
+          - php: '8.3'
+            laravel: '13'
+            testbench: '11'
+          - php: '8.4'
+            laravel: '12'
+            testbench: '10'
+          - php: '8.4'
+            laravel: '13'
+            testbench: '11'
+          - php: '8.5'
+            laravel: '12'
+            testbench: '10'
+          - php: '8.5'
             laravel: '13'
             testbench: '11'
 
@@ -32,6 +47,8 @@ jobs:
           php-version: ${{ matrix.php }}
           coverage: none
           tools: composer:v2
+        env:
+          update: true
 
       - name: Validate Composer configuration
         run: composer validate --strict
