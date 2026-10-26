@@ -99,6 +99,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                     config('http-remember.ignored_headers'),
                     config('http-remember.max_response_bytes'),
                     config('http-remember.refresh_cooldown'),
+                    config('http-remember.max_request_bytes'),
                 );
 
                 // Require an explicit group instead of treating direct invalidation as a cache-wide flush.

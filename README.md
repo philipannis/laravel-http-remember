@@ -291,6 +291,9 @@ return [
     // Wait at least 15 seconds after failed refreshes, honoring longer retry-after delays.
     'refresh_cooldown' => 15,
 
+    // Bypass response caching for request bodies larger than 1 MB.
+    'max_request_bytes' => 1_000_000,
+
     // Cache response bodies up to 1 MB.
     'max_response_bytes' => 1_000_000,
 
@@ -321,6 +324,7 @@ return [
 - `store` is a configured cache store name. Leave it `null` to use your application's default, or set it to `'redis'` to use Redis.
 - `refresh_timeout` must be a positive integer. It caps Guzzle's `timeout`, `connect_timeout`, and `read_timeout` options for deferred refreshes only. Shorter timeouts stay unchanged. Unlimited or longer timeouts use this cap. It doesn't change timeouts for requests that callers wait for.
 - `refresh_cooldown` must be a positive integer and defaults to **15 seconds**. Failed deferred HTTP responses and transport exceptions pause later refreshes for at least this long. A valid `Retry-After` can lengthen that delay. Foreground requests and the original response lifetime stay unchanged.
+- `max_request_bytes` must be a positive integer and defaults to **1 MB (1,000,000 bytes)**. Request bodies exactly at the limit remain eligible. Larger bodies go live without reading or writing cached responses or scheduling deferred refreshes, even when a matching cached response exists. The limit applies to actual body bytes and is independent of `max_response_bytes`. It does not restrict live uploads or grouped mutation invalidation.
 - `max_response_bytes` must be a positive integer and defaults to **1 MB (1,000,000 bytes)**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible. Larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
 - `event_logs.enabled` defaults to `true` when `APP_ENV` is `local`, `development`, or `dev`, and `false` otherwise. Set it explicitly to enable or disable event log output in any environment. Laravel listeners still receive event logs when file output is disabled.
 - `event_logs.channel` defaults to `'http-remember'`. The package supplies a daily log at `storage/logs/http-remember-YYYY-MM-DD.log`, with a `debug` level and 7 days of retention. Define `logging.channels.http-remember` to customize that channel, choose another configured channel, or use `null` for the application's default. Existing cache failure warnings use the selected channel even when routine event log output is disabled.
@@ -470,7 +474,7 @@ Event::listen(HttpRememberEventLog::class, function (HttpRememberEventLog $event
 
 Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, `exception`, and `retryAt`. Unavailable fields are `null`. Cooldown skips include `retryAt` as the next permitted refresh's Unix timestamp. `toArray()` uses `cache_key`, `group_hash`, and `retry_at` for log context. Keys and groups are hashed. Records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.
 
-Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `refresh_lock_unavailable`, or `cooldown`.
+Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `request_size`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `request_size`, `refresh_lock_unavailable`, or `cooldown`.
 
 Stale hits outside cooldown emit `refresh_scheduled`, while Laravel deduplicates actual execution by callback name. Hits during cooldown emit `refresh_skipped` instead. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
 
@@ -546,12 +550,21 @@ These requests skip caching even when a matching cached response already exists:
 | Streaming or `sink()` downloads | They need to keep their streaming or file-writing behavior. |
 | Multipart uploads | Upload streams and generated boundaries aren't suitable for reuse. |
 | Unreadable, non-seekable, or already-consumed request bodies | The body can't be hashed and restored safely. |
+| Request bodies larger than `max_request_bytes` | Hashing and deferred upload copies must stay within the request size budget. |
 | Custom cURL options, including digest and NTLM authentication | They can change behavior outside the request used for the cache key. |
 | Custom `stream_context` options | They can override headers, bodies, or transport behavior outside the request used for the cache key. |
 
 Grouped mutations retain invalidation even when uploads, custom callbacks, or these other options bypass response caching.
 
 Unreadable or non-seekable response bodies are also returned without being cached.
+
+### Request size limits
+
+`max_request_bytes` bounds the request bodies eligible for caching in both fixed and stale-while-revalidate modes. Hashing reads bounded chunks, stops after at most the limit plus one probe byte, and restores the original stream position before the live transfer. Known oversized bodies bypass caching without being read. Missing or inaccurate stream sizes and `Content-Length` headers cannot bypass the limit.
+
+Deferred refreshes copy eligible uploads in chunks into an independent temporary stream that can spill to disk. They recheck the limit while copying in case request events changed the body after fingerprinting. An oversized copy cancels the refresh while preserving the cached response and the original stream position.
+
+Configure request and response budgets separately: a large search payload may return a small result, while a small query may return a large response. Raising the request budget permits more hashing and temporary storage. Lowering it bypasses existing entries for oversized requests without removing those entries or changing their expiry. The setting is captured when `remember()` is called, and it does not change the cache key for requests that remain eligible.
 
 ### Response size limits
 
