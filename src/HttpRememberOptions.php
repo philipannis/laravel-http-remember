@@ -14,6 +14,11 @@ use InvalidArgumentException;
 final readonly class HttpRememberOptions
 {
     /**
+     * The default maximum request body size eligible for response caching in bytes.
+     */
+    public const DEFAULT_MAX_REQUEST_BYTES = 1_000_000;
+
+    /**
      * The default maximum cached response body size in bytes.
      */
     public const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
@@ -73,8 +78,9 @@ final readonly class HttpRememberOptions
      * @param  list<string>  $ignoredHeaders  Request header names excluded from cache fingerprints.
      * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
      * @param  int  $refreshCooldown  The minimum delay after a failed deferred refresh in seconds.
+     * @param  int  $maxRequestBytes  The maximum request body size eligible for response caching in bytes.
      *
-     * @throws InvalidArgumentException When a duration, cache store, group, operation, header name, or response size is invalid.
+     * @throws InvalidArgumentException When a duration, cache store, group, operation, header name, or body size is invalid.
      */
     public function __construct(
         int|array $ttl,
@@ -86,6 +92,7 @@ final readonly class HttpRememberOptions
         array $ignoredHeaders = [],
         public int $maxResponseBytes = self::DEFAULT_MAX_RESPONSE_BYTES,
         public int $refreshCooldown = 15,
+        public int $maxRequestBytes = self::DEFAULT_MAX_REQUEST_BYTES,
     ) {
         // Keep every supported callable in an immutable closure without rebinding its scope.
         $this->cacheWhen = $cacheWhen === null ? null : Closure::fromCallable($cacheWhen);
@@ -103,6 +110,11 @@ final readonly class HttpRememberOptions
         // Require a bounded response budget instead of silently allowing unlimited buffering.
         if ($maxResponseBytes <= 0) {
             throw new InvalidArgumentException('The HTTP remember maximum response size must be a positive number of bytes.');
+        }
+
+        // Bound request hashing and deferred upload copies independently of response sizes.
+        if ($maxRequestBytes <= 0) {
+            throw new InvalidArgumentException('The HTTP remember maximum request size must be a positive number of bytes.');
         }
 
         // Reject empty store names so configuration mistakes remain visible.

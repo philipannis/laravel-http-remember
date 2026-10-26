@@ -61,6 +61,11 @@ final class HttpRememberMiddleware
     private const MISS_LOCK_SECONDS = 30;
 
     /**
+     * Maximum bytes read at once while fingerprinting an eligible request body.
+     */
+    private const REQUEST_BODY_CHUNK_BYTES = 8192;
+
+    /**
      * Create middleware for one immutable request policy.
      *
      * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, operation intent, eligibility predicate, and ignored headers.
@@ -120,8 +125,9 @@ final class HttpRememberMiddleware
                     return $this->sendAndInvalidate($handler, $request, $options, $eventLog);
                 }
 
-                // Avoid consuming uploads, streams, or downloads with transfer side effects.
-                if (($reason = $this->bypassReason($request, $options, $canCache)) !== null) {
+                // Bound request hashing before accessing the cache or copying a deferred upload.
+                $bodyHash = '';
+                if (($reason = $this->bypassReason($request, $options, $canCache, $bodyHash)) !== null) {
                     $eventLog('bypass', null, ['reason' => $reason]);
 
                     return $this->sendLive($handler, $request, $options, null, $eventLog);
@@ -145,7 +151,7 @@ final class HttpRememberMiddleware
                             : HttpRememberGroup::resolve($cache, $this->settings->groupHash);
 
                         // Fingerprint the prepared request and its current invalidation generation.
-                        $key = $this->cacheKey($request, $options, $group);
+                        $key = $this->cacheKey($request, $options, $group, $bodyHash);
 
                         // Recheck once after waiting so another worker's response avoids a live fetch.
                         do {
@@ -343,9 +349,10 @@ final class HttpRememberMiddleware
      * @param  RequestInterface  $request  The prepared outgoing request.
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
+     * @param  string  $bodyHash  The complete body fingerprint populated when caching can proceed.
      * @return string|null The bypass reason, or null when caching can proceed.
      */
-    private function bypassReason(RequestInterface $request, array $options, Closure $canCache): ?string
+    private function bypassReason(RequestInterface $request, array $options, Closure $canCache, string &$bodyHash): ?string
     {
         // Avoid caching an identity that a later middleware or callback might change.
         if (! $canCache()) {
@@ -382,7 +389,42 @@ final class HttpRememberMiddleware
 
         // Cache only readable, seekable bodies positioned at the beginning of the stream.
         try {
-            return ! $body->isReadable() || ! $body->isSeekable() || $body->tell() !== 0 ? 'request_body' : null;
+            if (! $body->isReadable() || ! $body->isSeekable() || $body->tell() !== 0) {
+                return 'request_body';
+            }
+
+            // Skip known oversized uploads before reading any of their bytes.
+            $size = $body->getSize();
+            if ($size !== null && $size > $this->settings->maxRequestBytes) {
+                return 'request_size';
+            }
+
+            // Hash bounded chunks so unknown or inaccurate sizes cannot permit unbounded reads.
+            $hash = hash_init('sha256');
+            $remaining = $this->settings->maxRequestBytes;
+            try {
+                while ($remaining > 0 && ! $body->eof()) {
+                    $chunk = $body->read(min(self::REQUEST_BODY_CHUNK_BYTES, $remaining));
+                    if ($chunk === '') {
+                        break;
+                    }
+
+                    hash_update($hash, $chunk);
+                    $remaining -= strlen($chunk);
+                }
+
+                // Probe one extra byte without accepting truncated or stalled request bodies.
+                if (! $body->eof() && ($body->read(1) !== '' || ! $body->eof())) {
+                    return 'request_size';
+                }
+
+                $bodyHash = hash_final($hash);
+
+                return null;
+            } finally {
+                // Leave the original upload ready for the live handler or cache-hit events.
+                $body->rewind();
+            }
         } catch (Throwable) {
             // Let the original handler decide how to handle an unusable request stream.
             return 'request_body';
@@ -395,11 +437,10 @@ final class HttpRememberMiddleware
      * @param  RequestInterface  $request  The request at the middleware's stack position.
      * @param  array<string, mixed>  $options  The Guzzle transfer options.
      * @param  HttpRememberGroup|null  $group  The selected invalidation generation, or no grouping.
+     * @param  string  $bodyHash  The complete fingerprint of a request body within its size budget.
      * @return string A namespaced SHA-256 key for this request and lifetime policy.
-     *
-     * @throws RuntimeException When the request body cannot be fingerprinted.
      */
-    private function cacheKey(RequestInterface $request, array $options, ?HttpRememberGroup $group): string
+    private function cacheKey(RequestInterface $request, array $options, ?HttpRememberGroup $group, string $bodyHash): string
     {
         // Normalize names and omit configured headers without changing the outgoing request.
         $headers = array_diff_key(
@@ -407,15 +448,6 @@ final class HttpRememberMiddleware
             array_flip($this->settings->ignoredHeaders),
         );
         ksort($headers);
-
-        // Restore the request stream even when hashing an unusual stream fails.
-        try {
-            // Hash the complete upload body as part of the request's identity.
-            $bodyHash = Utils::hash($request->getBody(), 'sha256');
-        } finally {
-            // Leave the upload ready for the original HTTP handler.
-            $request->getBody()->rewind();
-        }
 
         // Separate payloads, credentials, transport variants, and per-request lifetimes.
         $identity = [
@@ -671,8 +703,25 @@ final class HttpRememberMiddleware
             // Include bytes already consumed by request logging or other body inspection.
             $body->rewind();
 
-            // Give the deferred request its own replayable upload stream.
-            $request = $request->withBody(Utils::streamFor($body->getContents()));
+            // Copy bounded chunks into a temporary stream that can spill larger uploads to disk.
+            $copy = Utils::streamFor();
+            Utils::copyToStream($body, $copy, $this->settings->maxRequestBytes);
+
+            // Reject incomplete temporary writes instead of replaying a truncated upload.
+            if ($copy->tell() !== $body->tell()) {
+                throw new RuntimeException('The HTTP remember request body could not be copied completely.');
+            }
+
+            // Recheck the budget in case request events changed the body after fingerprinting.
+            if (! $body->eof() && ($body->read(1) !== '' || ! $body->eof())) {
+                $eventLog('refresh_skipped', $key, ['reason' => 'request_size']);
+
+                return;
+            }
+
+            // Give the deferred request its own complete, replayable upload stream.
+            $copy->rewind();
+            $request = $request->withBody($copy);
         } finally {
             // Restore the caller's original cursor even when copying the body fails.
             $body->seek($position);

@@ -49,6 +49,7 @@ final class OptionsTest extends TestCase
         self::assertSame(self::REFRESH_TIMEOUT_SECONDS, $options->refreshTimeout);
         self::assertSame(15, $options->refreshCooldown);
         self::assertSame(1_000_000, $options->maxResponseBytes);
+        self::assertSame(1_000_000, $options->maxRequestBytes);
     }
 
     /**
@@ -171,7 +172,7 @@ final class OptionsTest extends TestCase
      *
      * @param  int  $maxResponseBytes  The invalid response size in bytes.
      */
-    #[DataProvider('invalidResponseSizes')]
+    #[DataProvider('invalidBodySizes')]
     public function test_invalid_response_size_is_rejected(int $maxResponseBytes): void
     {
         // Require a positive budget instead of interpreting a non-positive value as unlimited.
@@ -187,15 +188,53 @@ final class OptionsTest extends TestCase
     }
 
     /**
-     * Provide response budgets that cannot bound cached body sizes.
+     * Provide request and response budgets that cannot bound body sizes.
      *
      * @return iterable<string, array{int}> Invalid sizes keyed by purpose.
      */
-    public static function invalidResponseSizes(): iterable
+    public static function invalidBodySizes(): iterable
     {
         // Reject both an empty budget and the common unlimited sentinel.
         yield 'zero bytes' => [0];
         yield 'negative bytes' => [-1];
+    }
+
+    /**
+     * Confirm request and response size budgets can be configured independently.
+     */
+    public function test_request_size_limit_can_be_configured(): void
+    {
+        // Keep upload eligibility separate from the response payload retained in the cache.
+        $options = new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            maxResponseBytes: 32,
+            maxRequestBytes: 16,
+        );
+
+        // Preserve both byte budgets without changing the lifetime policy.
+        self::assertSame(16, $options->maxRequestBytes);
+        self::assertSame(32, $options->maxResponseBytes);
+    }
+
+    /**
+     * Confirm zero and negative request budgets fail before middleware is attached.
+     *
+     * @param  int  $maxRequestBytes  The invalid request size in bytes.
+     */
+    #[DataProvider('invalidBodySizes')]
+    public function test_invalid_request_size_is_rejected(int $maxRequestBytes): void
+    {
+        // Require a positive upload budget instead of permitting unlimited refresh copies.
+        $this->expectException(InvalidArgumentException::class);
+
+        new HttpRememberOptions(
+            self::FIXED_LIFETIME_SECONDS,
+            null,
+            self::REFRESH_TIMEOUT_SECONDS,
+            maxRequestBytes: $maxRequestBytes,
+        );
     }
 
     /**
