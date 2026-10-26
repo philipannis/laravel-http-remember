@@ -328,7 +328,7 @@ return [
 - `max_response_bytes` must be a positive integer and defaults to **1 MB (1,000,000 bytes)**. It limits the response body copied into the cache, including during deferred refreshes. Bodies exactly at the limit are eligible. Larger bodies pass through normally without being cached. Existing entries keep their original expiry when the limit changes. The limit applies to the actual body stream, after decompression when enabled, and excludes headers and cache serialization overhead.
 - `event_logs.enabled` defaults to `true` when `APP_ENV` is `local`, `development`, or `dev`, and `false` otherwise. Set it explicitly to enable or disable event log output in any environment. Laravel listeners still receive event logs when file output is disabled.
 - `event_logs.channel` defaults to `'http-remember'`. The package supplies a daily log at `storage/logs/http-remember-YYYY-MM-DD.log`, with a `debug` level and 7 days of retention. Define `logging.channels.http-remember` to customize that channel, choose another configured channel, or use `null` for the application's default. Existing cache failure warnings use the selected channel even when routine event log output is disabled.
-- `event_logs.redact` defaults to `null`. Set a `callable(string): string` to mask sensitive values in log messages; see [Redact log messages](#redact-log-messages).
+- `event_logs.redact` defaults to `null`. Set a `callable(string): string` to mask sensitive values in log messages. See [Redact log messages](#redact-log-messages).
 - `ignored_headers` is a positional list of valid HTTP header names excluded from cache keys. The defaults cover common tracing and correlation headers, so changing a request ID does not create another cache entry. Names match case-insensitively and duplicates are removed. Blank names, names containing whitespace, associative arrays, and non-string values are rejected immediately. Replace the list to customize it, or set it to `[]` to include all request headers. Headers are still sent upstream normally.
 
 Calling `remember()` without arguments uses these defaults. Passing a lifetime or store overrides that setting for one request.
@@ -439,7 +439,7 @@ Then set this entry inside `event_logs` in `config/http-remember.php`:
 'redact' => [App\Support\HttpLogRedactor::class, 'redact'],
 ```
 
-Static callable arrays work with Laravel's cached configuration. Closures can also be supplied programmatically. The callback runs only for records being written, including failure warnings, and also receives direct group invalidation messages. It changes only the log message; requests, cache keys, and structured event context remain unchanged. If it throws, is not callable, or returns a non-string value, that log record is skipped without logging the original message. Event listeners still receive the structured event.
+Static callable arrays work with Laravel's cached configuration. Closures can also be supplied programmatically. The callback runs only for records being written, including failure warnings, and also receives direct group invalidation messages. It changes only the log message. Requests, cache keys, and structured event context remain unchanged. If it throws, is not callable, or returns a non-string value, that log record is skipped without logging the original message. Event listeners still receive the structured event.
 
 ### Listen for event logs
 
@@ -488,6 +488,10 @@ Keep `InvokeDeferredCallbacks` and the normal termination hooks enabled. Long-ru
 
 Refreshes replay the prepared request from the stale hit with an independent copy of its complete body. They reuse its URL, headers, credentials, and selected cache store. Credentials are not fetched again from application configuration. Foreground `delay` options are removed from the refresh.
 
+Deferred refreshes follow your request's `allow_redirects` settings. This includes the redirect limit, allowed protocols, method handling, and callbacks. Each refresh starts counting redirects from zero, and all requests in the chain share one timeout budget. Guzzle applies its usual rules for cookies and credentials when following redirects. Refreshes use a separate copy of your cookie jar, so they don't change your cookies.
+
+If the destination's response can be cached, it gets its own cache entry based on its URL, headers, and credentials. The old source response is then removed unless another request has replaced or invalidated it. Later calls to the source still follow its live redirect, but can reuse the cached destination response. If the redirect fails or the destination's response is rejected, the old source response keeps its original expiry. Invalidation during the refresh prevents it from storing a response.
+
 ### Failure behavior
 
 | What happens | Result |
@@ -499,7 +503,7 @@ Refreshes replay the prepared request from the stale hit with an independent cop
 | A deferred refresh fails | Keep the old entry until its original expiry and log the failure. |
 | A cache read or write fails | Let the live request proceed and log the cache failure. |
 
-Refreshes make one attempt through the remaining Guzzle handler stack. `retry()` still applies to foreground requests. Deferred refreshes don't repeat that outer retry loop. Failed refreshes never extend the stale period.
+Refreshes make one attempt and follow any redirects allowed by your request settings. `retry()` still applies to foreground requests. Deferred refreshes don't repeat that outer retry loop. Failed refreshes never extend the stale period.
 
 ### Refresh cooldowns
 

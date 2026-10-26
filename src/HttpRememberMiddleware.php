@@ -5,6 +5,10 @@ namespace PhilipAnnis\HttpRemember;
 use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
+use GuzzleHttp\Cookie\CookieJar;
+use GuzzleHttp\Cookie\CookieJarInterface;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Middleware;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7\Utils;
@@ -220,7 +224,7 @@ final class HttpRememberMiddleware
                             // Contain scheduling failures while preserving the cache hit.
                             try {
                                 // Defer a refresh of the generation served to this caller.
-                                $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group, $eventLog);
+                                $this->refreshLater($handler, $request, $options, $cache, $key, $cached, $canCache, $group, $eventLog, $store);
                             } catch (Throwable $exception) {
                                 // Report the scheduling failure using safe exception metadata.
                                 $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
@@ -512,6 +516,8 @@ final class HttpRememberMiddleware
      * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      * @param  HttpRememberResponse|null  $generation  The response to replace, or null for a cache miss.
      * @param  HttpRememberGroup|null  $group  The group generation observed before the transfer.
+     * @param  Closure(): bool|null  $canRemember  An additional generation guard for redirected refreshes.
+     * @param  string|null  $outcome  The final storage decision, when requested.
      * @return PromiseInterface The original response with cache persistence attached.
      */
     private function sendAndRemember(
@@ -523,6 +529,8 @@ final class HttpRememberMiddleware
         Closure $eventLog,
         ?HttpRememberResponse $generation = null,
         ?HttpRememberGroup $group = null,
+        ?Closure $canRemember = null,
+        ?string &$outcome = null,
     ): PromiseInterface {
         // Report foreground transport failures while deferred errors retain their refresh diagnostics.
         $promise = $generation === null
@@ -537,7 +545,7 @@ final class HttpRememberMiddleware
              * @param  ResponseInterface  $response  The live upstream response.
              * @return ResponseInterface The unchanged upstream response.
              */
-            function (ResponseInterface $response) use ($cache, $key, $generation, $group, $eventLog): ResponseInterface {
+            function (ResponseInterface $response) use ($cache, $key, $generation, $group, $eventLog, $canRemember, &$outcome): ResponseInterface {
                 // Keep every persistence outcome observable after the write lock is released.
                 $outcome = 'write_lock_unavailable';
 
@@ -545,7 +553,7 @@ final class HttpRememberMiddleware
                 try {
                     // Preserve declared response variants that the filtered key cannot distinguish.
                     if ($this->variesOnIgnoredHeaders($response)) {
-                        $this->recordStorageOutcome($eventLog, $key, 'vary', $response, $generation);
+                        $this->recordStorageOutcome($eventLog, $key, $outcome = 'vary', $response, $generation);
 
                         return $response;
                     }
@@ -556,7 +564,7 @@ final class HttpRememberMiddleware
 
                     // Persist only serializable successful responses accepted by the active predicate.
                     if ($cached === null || ! $this->allowsResponse($response, $cached, $key, $eventLog)) {
-                        $this->recordStorageOutcome($eventLog, $key, $reason ?? 'response_predicate', $response, $generation);
+                        $this->recordStorageOutcome($eventLog, $key, $outcome = $reason ?? 'response_predicate', $response, $generation);
 
                         return $response;
                     }
@@ -568,11 +576,19 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($cache, $key, $generation, $cached, $group, $eventLog, &$outcome): void {
+                        function () use ($cache, $key, $generation, $cached, $group, $eventLog, $canRemember, &$outcome): void {
                             // Cancel writes started before a successful mutation or metadata removal.
                             if ($group !== null && ! $group->isCurrent()) {
                                 $outcome = 'group_invalidated';
 
+                                return;
+                            }
+
+                            // Keep redirected destinations tied to the source response being refreshed.
+                            if ($canRemember !== null && ! $canRemember()) {
+                                $outcome = 'generation_changed';
+
+                                // Leave the destination untouched when its source is no longer current.
                                 return;
                             }
 
@@ -672,6 +688,7 @@ final class HttpRememberMiddleware
      * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
      * @param  HttpRememberGroup|null  $group  The group generation served by the stale response.
      * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
+     * @param  string|null  $storeName  The store name captured before the stale request starts.
      */
     private function refreshLater(
         callable $handler,
@@ -683,6 +700,7 @@ final class HttpRememberMiddleware
         Closure $canCache,
         ?HttpRememberGroup $group,
         Closure $eventLog,
+        ?string $storeName,
     ): void {
         // Scope cooldowns to the original generation so replacements start without old failures.
         $cooldownKey = $key.':refresh-cooldown:'.$generation->id();
@@ -734,8 +752,13 @@ final class HttpRememberMiddleware
             $options[$option] = $timeout > 0 ? min($timeout, $this->settings->refreshTimeout) : $this->settings->refreshTimeout;
         }
 
-        // A foreground transfer delay should not delay the deferred refresh too.
-        unset($options['delay']);
+        // Start an independent redirect chain without repeating the foreground delay.
+        unset($options['delay'], $options['__redirect_count']);
+
+        // Preserve destination cookies without letting deferred redirects mutate the caller's jar.
+        if (($options['cookies'] ?? null) instanceof CookieJarInterface) {
+            $options['cookies'] = new CookieJar(false, $options['cookies']->toArray());
+        }
 
         // Deduplicate the resolved store even when its default name changes or is explicit.
         $name = 'http-remember:refresh:'.hash('sha256', serialize([
@@ -750,7 +773,7 @@ final class HttpRememberMiddleware
              *
              * @return void
              */
-            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey): void {
+            function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey, $storeName): void {
                 // Contain refresh failures after the caller has received its response.
                 try {
                     // Recheck the generation after acquiring any available refresh lock.
@@ -760,7 +783,7 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey): void {
+                        function () use ($handler, $request, $options, $cache, $key, $generation, $canCache, $group, $eventLog, $cooldownKey, $storeName): void {
                             // Skip expired responses and groups invalidated before deferred execution.
                             $reason = match (true) {
                                 $generation->hasReached($this->settings->lifetime) => 'expired',
@@ -787,7 +810,7 @@ final class HttpRememberMiddleware
 
                             // Wait only during deferred execution, never while serving stale data.
                             try {
-                                $response = $this->sendAndRemember($handler, $request, $options, $cache, $key, $eventLog, $generation, $group)->wait();
+                                $response = $this->sendRefresh($handler, $request, $options, $cache, $key, $generation, $group, $canCache, $eventLog, $storeName);
                             } catch (Throwable $exception) {
                                 // Persist the cooldown before releasing the lock without masking the transport error.
                                 $this->coolDownRefresh($cache, $key, $cooldownKey, $generation, $eventLog);
@@ -825,6 +848,167 @@ final class HttpRememberMiddleware
 
         // Each stale hit requests scheduling; Laravel deduplicates execution by callback name.
         $eventLog('refresh_scheduled', $key, ['age' => $generation->age()]);
+    }
+
+    /**
+     * Follow deferred redirects while keeping destination credentials and cache entries separate.
+     *
+     * @param  Handler  $handler  The original handler below Guzzle's redirect and cookie middleware.
+     * @param  RequestInterface  $request  The independent prepared request being refreshed.
+     * @param  array<string, mixed>  $options  The bounded transfer options and isolated cookie jar.
+     * @param  Repository  $cache  The cache repository selected by the stale caller.
+     * @param  string  $key  The source response's cache key.
+     * @param  HttpRememberResponse  $generation  The source generation allowed to complete this refresh.
+     * @param  HttpRememberGroup|null  $group  The group generation served by the stale response.
+     * @param  Closure(): bool  $canCache  The mutation guard bound to the sending builder.
+     * @param  EventLogger  $eventLog  The publisher bound to the source request.
+     * @param  string|null  $storeName  The store name captured before the stale request starts.
+     * @return ResponseInterface The final response after applying the caller's redirect policy.
+     */
+    private function sendRefresh(
+        callable $handler,
+        RequestInterface $request,
+        array $options,
+        Repository $cache,
+        string $key,
+        HttpRememberResponse $generation,
+        ?HttpRememberGroup $group,
+        Closure $canCache,
+        Closure $eventLog,
+        ?string $storeName,
+    ): ResponseInterface {
+        // Keep the entire chain inside the timeout covered by the existing refresh lock.
+        $deadline = hrtime(true) / 1_000_000_000 + $options['timeout'];
+
+        // Track the final destination and storage decision across sequential redirect hops.
+        $first = true;
+        $destinationKey = $key;
+        $outcome = null;
+
+        // Reuse the source generation check before destination writes and source removal.
+        $canRemember =
+            /**
+             * Cancel destination writes when the source response was removed or replaced.
+             *
+             * @return bool Whether the original source generation is still present.
+             */
+            static fn (): bool => HttpRememberResponse::restore($cache->get($key))?->id() === $generation->id();
+
+        // Bind each transfer to the original cache store, group, and refresh deadline.
+        $send =
+            /**
+             * Fetch each hop live and retain successful responses under their own request identity.
+             *
+             * @param  RequestInterface  $nextRequest  The request after redirect and cookie preparation.
+             * @param  array<string, mixed>  $nextOptions  The caller's options for this hop.
+             * @return PromiseInterface The unchanged upstream response with optional persistence.
+             */
+            function (RequestInterface $nextRequest, array $nextOptions) use ($handler, $cache, $key, $generation, $group, $canCache, $canRemember, $eventLog, $storeName, $deadline, &$first, &$destinationKey, &$outcome): PromiseInterface {
+                // Preserve the first hop's exact timeout and spend only its remainder on redirects.
+                if (! $first) {
+                    // Include time spent in earlier transfers and redirect callbacks.
+                    $remaining = $deadline - hrtime(true) / 1_000_000_000;
+
+                    // Stop before starting another transfer once the shared budget is exhausted.
+                    if ($remaining <= 0) {
+                        throw new ConnectException('The HTTP remember refresh timeout was exhausted during redirects.', $nextRequest);
+                    }
+
+                    // Preserve shorter limits while capping every timeout at the remaining budget.
+                    foreach (['timeout', 'connect_timeout', 'read_timeout'] as $option) {
+                        $nextOptions[$option] = min($nextOptions[$option], $remaining);
+                    }
+                }
+
+                // Require every subsequent hop to use the remaining refresh budget.
+                $first = false;
+
+                // Recheck hooks and request bodies that a redirect callback may have changed.
+                $bodyHash = '';
+                if (($reason = $this->bypassReason($nextRequest, $nextOptions, $canCache, $bodyHash)) !== null) {
+                    // Keep bypassed destinations from retiring the source cache entry.
+                    $destinationKey = null;
+                    $outcome = $reason;
+                    $eventLog('bypass', null, ['reason' => $reason]);
+
+                    // Preserve the live transfer even when this hop cannot be cached.
+                    return $handler($nextRequest, $nextOptions);
+                }
+
+                // Never cache a destination's session response under the source URL's credentials.
+                $destinationKey = $this->cacheKey($nextRequest, $nextOptions, $group, $bodyHash);
+
+                // Replace the source generation or populate the destination under the same safeguards.
+                return $this->sendAndRemember(
+                    $handler,
+                    $nextRequest,
+                    $nextOptions,
+                    $cache,
+                    $destinationKey,
+                    $destinationKey === $key ? $eventLog : $this->eventLogger($nextRequest, $storeName),
+                    $destinationKey === $key ? $generation : null,
+                    $group,
+                    $canRemember,
+                    $outcome,
+                );
+            };
+
+        // Restore Guzzle's standard redirect, cookie, and body preparation around the inner handler.
+        $redirect = Middleware::redirect()(Middleware::cookies()(Middleware::prepareBody()($send)));
+
+        // Wait for the entire chain only while the deferred callback is running.
+        $response = $redirect($request, $options)->wait();
+
+        // Ordinary refreshes already report their outcome, and failed chains retain the source response.
+        if ($destinationKey === $key || $response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_MULTIPLE_CHOICES) {
+            return $response;
+        }
+
+        // Remove the old source only after an eligible destination was stored or already cached.
+        if (in_array($outcome, ['stored', 'generation_changed'], true)) {
+            // Contain cache removal failures without treating a completed transfer as a network failure.
+            try {
+                // Recheck the source inside the same write lock used by foreground replacements.
+                $forget =
+                    /**
+                     * Preserve concurrent source replacements and invalidated groups.
+                     *
+                     * @return bool Whether the original source entry was removed.
+                     */
+                    static function () use ($cache, $key, $group, $canRemember): bool {
+                        // Leave newer responses and invalidated groups untouched.
+                        if (($group !== null && ! $group->isCurrent()) || ! $canRemember()) {
+                            return false;
+                        }
+
+                        // Report stores that reject removal without throwing an exception.
+                        if (! $cache->forget($key)) {
+                            throw new RuntimeException('The HTTP remember redirected source could not be removed.');
+                        }
+
+                        // Confirm that later source requests must follow the live redirect.
+                        return true;
+                    };
+
+                // Coordinate source removal without waiting when the selected store supports locks.
+                $store = $cache->getStore();
+                $forgotten = $store instanceof LockProvider
+                    ? $store->lock($key.':write', self::WRITE_LOCK_SECONDS)->get($forget)
+                    : $forget();
+
+                // Publish the source refresh outcome after releasing any write lock.
+                $eventLog($forgotten ? 'refresh_succeeded' : 'refresh_skipped', $key, ['reason' => $forgotten ? null : 'generation_changed', 'status' => $response->getStatusCode()]);
+            } catch (Throwable $exception) {
+                // Keep cache failures separate from the successfully completed redirect chain.
+                $this->logFailure('refresh', $key, ['exception' => $exception::class], $eventLog);
+            }
+        } else {
+            // Explain why an ineligible or unstored destination left the source entry in place.
+            $eventLog('refresh_skipped', $key, ['reason' => $outcome, 'status' => $response->getStatusCode()]);
+        }
+
+        // Preserve the final response for the existing refresh failure and cooldown handling.
+        return $response;
     }
 
     /**
