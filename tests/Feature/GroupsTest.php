@@ -146,26 +146,28 @@ final class GroupsTest extends TestCase
     }
 
     /**
-     * Confirm omitted and empty groups preserve the original caching behavior for every method.
+     * Confirm ungrouped mutations stay live unless the caller explicitly identifies a read.
      *
      * @param  string  $method  The HTTP method used without automatic group invalidation.
      */
     #[DataProvider('mutationMethods')]
-    public function test_ungrouped_requests_keep_the_original_caching_behavior(string $method): void
+    public function test_ungrouped_mutations_require_explicit_read_intent(string $method): void
     {
-        // Populate an explicit group before caching an ungrouped operation.
+        // Populate an explicit group before sending an unrelated ungrouped mutation.
         $this->fakeVersionedApi();
         Http::remember(60, group: self::GROUP)->get(self::API_URL);
         $first = Http::remember(60)->send($method, self::MUTATION_URL);
         $second = Http::remember(60, group: null, operation: 'read')->send($method, self::MUTATION_URL);
         $empty = Http::remember(60, group: [])->send($method, self::MUTATION_URL);
 
-        // Retain the ordinary cache identity without invalidating grouped reads.
+        // Only the explicitly identified read may populate or reuse the ungrouped response cache.
         self::assertSame(2, $first->json('version'));
-        self::assertSame($first->json(), $second->json());
-        self::assertSame($first->json(), $empty->json());
+        self::assertSame(3, $second->json('version'));
+        self::assertSame(4, $empty->json('version'));
+        self::assertSame(3, Http::remember(60, operation: 'read')->send($method, self::MUTATION_URL)->json('version'));
         self::assertSame(1, Http::remember(60, group: self::GROUP)->get(self::API_URL)->json('version'));
-        Http::assertSentCount(2);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(4);
     }
 
     /**

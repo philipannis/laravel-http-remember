@@ -476,5 +476,12 @@ final class ResponseTest extends TestCase
         yield 'failed status' => [array_replace($valid, ['status' => HttpStatus::HTTP_SERVICE_UNAVAILABLE])];
         yield 'non-list header' => [array_replace($valid, ['headers' => ['X-Test' => [1 => 'value']]])];
         yield 'non-string header value' => [array_replace($valid, ['headers' => ['X-Test' => [123]]])];
+
+        // Reject malformed HTTP freshness metadata rather than weakening the stored origin policy.
+        yield 'negative freshness' => [array_replace($valid, ['fresh' => -1.0])];
+        yield 'infinite lifetime' => [array_replace($valid, ['lifetime' => INF])];
+        yield 'non-numeric upstream age' => [array_replace($valid, ['initial_age' => '10'])];
+        yield 'negative upstream age' => [array_replace($valid, ['initial_age' => -1])];
+        yield 'freshness beyond lifetime' => [array_replace($valid, ['fresh' => 20.0, 'lifetime' => 10.0])];
     }
 }

@@ -150,7 +150,7 @@ final class ResponseEligibilityTest extends TestCase
                  * Check that warnings retain event context without leaking private exception details.
                  */
                 static fn (array $context): bool => count($context) === 10
-                    && preg_match('/^http-remember:[a-f0-9]{64}$/', $context['cache_key']) === 1
+                    && preg_match('/^http-remember:v2:[a-f0-9]{64}$/', $context['cache_key']) === 1
                     && $context['event'] === 'failed'
                     && $context['operation'] === 'eligibility'
                     && $context['retry_at'] === null
@@ -313,7 +313,7 @@ final class ResponseEligibilityTest extends TestCase
     public function test_predicate_body_stream_is_independent_of_live_and_cached_responses(): void
     {
         // Preserve original headers and a partially consumed body from the controlled handler.
-        $live = new PsrResponse(201, ['Set-Cookie' => 'session=live', 'X-Result' => 'created'], '{"version":1}', '2.0');
+        $live = new PsrResponse(201, ['X-Result' => 'created'], '{"version":1}', '2.0');
         $live->getBody()->seek(4);
         $inspections = 0;
         $handler = $this->middleware(
@@ -325,7 +325,6 @@ final class ResponseEligibilityTest extends TestCase
                 self::assertSame('created', $response->header('X-Result'));
                 self::assertSame('2.0', $response->toPsrResponse()->getProtocolVersion());
                 self::assertSame(['version' => 1], $response->json());
-                self::assertSame('session=live', $response->header('Set-Cookie'));
                 $inspections++;
                 $response->toPsrResponse()->getBody()->close();
 
@@ -339,10 +338,10 @@ final class ResponseEligibilityTest extends TestCase
         );
         $request = new Request('GET', self::API_URL);
 
-        // Preserve the live cursor and cookie header after inspecting the independent copy.
+        // Preserve the live cursor and original headers after inspecting the independent copy.
         self::assertSame($live, $handler($request, [])->wait());
         self::assertSame(4, $live->getBody()->tell());
-        self::assertSame('session=live', $live->getHeaderLine('Set-Cookie'));
+        self::assertSame('created', $live->getHeaderLine('X-Result'));
 
         // Reuse the original cached body without inspecting it again.
         $cached = $handler($request, [])->wait();

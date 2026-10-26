@@ -65,8 +65,8 @@ class HttpRememberServiceProvider extends ServiceProvider
              *
              * @param  int|array{int, int}|null  $ttl  A lifetime, thresholds, or configured default.
              * @param  string|null  $store  A cache store override, or the configured default.
-             * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
-             * @param  'read'|HttpRememberOperation|null  $operation  Explicit read intent; the internal marker identifies omission.
+             * @param  list<string>|null  $group  The complete invalidation group. Null or an empty list disables grouping.
+             * @param  'read'|HttpRememberOperation|null  $operation  Explicit read intent, or the internal marker for automatic method detection.
              * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
              * @param  bool  $invalidate  Whether to invalidate the supplied group immediately without an HTTP request.
              * @return PendingRequest The same request builder for further chaining.
@@ -90,15 +90,15 @@ class HttpRememberServiceProvider extends ServiceProvider
 
                 // Resolve configuration when called so requests do not share mutable policies.
                 $settings = new HttpRememberOptions(
-                    $ttl ?? config('http-remember.ttl'),
+                    $ttl ?? config('http-remember.ttl_seconds'),
                     $store ?? config('http-remember.store'),
-                    config('http-remember.refresh_timeout'),
+                    config('http-remember.refresh_timeout_seconds'),
                     $group,
                     $operation === HttpRememberOperation::Automatic ? null : $operation,
                     $cacheWhen,
                     config('http-remember.ignored_headers'),
                     config('http-remember.max_response_bytes'),
-                    config('http-remember.refresh_cooldown'),
+                    config('http-remember.refresh_cooldown_seconds'),
                     config('http-remember.max_request_bytes'),
                 );
 
@@ -143,7 +143,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                      * @return bool Whether all request mutations precede the cache layer.
                      */
                     function (): bool {
-                        // Laravel adds one internal callback; additional callbacks can mutate requests.
+                        // Laravel adds one internal callback. Any others can change the request.
                         return $this->beforeSendingCallbacks->count() === HttpRememberServiceProvider::INTERNAL_BEFORE_SENDING_CALLBACK_COUNT
                             && $this->middleware->last() instanceof HttpRememberMiddleware;
                     };

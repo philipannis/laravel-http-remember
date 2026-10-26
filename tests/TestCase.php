@@ -15,12 +15,12 @@ abstract class TestCase extends Orchestra
     /**
      * The package's default fresh threshold in seconds.
      */
-    private const DEFAULT_FRESH_SECONDS = 1800;
+    private const DEFAULT_FRESH_SECONDS = 60;
 
     /**
      * The package's default total lifetime in seconds.
      */
-    private const DEFAULT_LIFETIME_SECONDS = 3600;
+    private const DEFAULT_LIFETIME_SECONDS = 300;
 
     /**
      * The package's default deferred refresh timeout in seconds.
@@ -64,9 +64,9 @@ abstract class TestCase extends Orchestra
         $app['config']->set('cache.default', 'array');
 
         // Use the documented package defaults unless a test overrides them.
-        $app['config']->set('http-remember.ttl', [self::DEFAULT_FRESH_SECONDS, self::DEFAULT_LIFETIME_SECONDS]);
+        $app['config']->set('http-remember.ttl_seconds', [self::DEFAULT_FRESH_SECONDS, self::DEFAULT_LIFETIME_SECONDS]);
         $app['config']->set('http-remember.store', null);
-        $app['config']->set('http-remember.refresh_timeout', self::DEFAULT_REFRESH_TIMEOUT_SECONDS);
+        $app['config']->set('http-remember.refresh_timeout_seconds', self::DEFAULT_REFRESH_TIMEOUT_SECONDS);
 
         // Keep routine event logs in memory unless a test explicitly exercises a log channel.
         $app['config']->set('http-remember.event_logs.enabled', false);

@@ -62,8 +62,8 @@ final class RequestSizeTest extends TestCase
         Http::fakeSequence()->push('first-response')->push('second-response');
 
         // Preserve ordinary live transfers without caching or deferring either response.
-        self::assertSame('first-response', Http::withBody($stream)->remember([0, 60])->post(self::API_URL)->body());
-        self::assertSame('second-response', Http::withBody($stream)->remember([0, 60])->post(self::API_URL)->body());
+        self::assertSame('first-response', Http::withBody($stream)->remember([0, 60], operation: 'read')->post(self::API_URL)->body());
+        self::assertSame('second-response', Http::withBody($stream)->remember([0, 60], operation: 'read')->post(self::API_URL)->body());
         self::assertSame(0, $stream->tell());
         self::assertSame([], Cache::store()->getStore()->all());
         self::assertCount(0, app(DeferredCallbackCollection::class));
@@ -95,7 +95,7 @@ final class RequestSizeTest extends TestCase
 
         // Reuse only eligible requests while preserving both response contracts.
         for ($call = 0; $call < 2; $call++) {
-            $response = Http::async($async)->withBody($contents)->remember(60)->post(self::API_URL);
+            $response = Http::async($async)->withBody($contents)->remember(60, operation: 'read')->post(self::API_URL);
             if ($async) {
                 self::assertInstanceOf(PromiseInterface::class, $response);
                 $response = $response->wait();
@@ -241,7 +241,7 @@ final class RequestSizeTest extends TestCase
         Carbon::setTestNow($start);
         $contents = str_repeat('x', self::MAX_REQUEST_BYTES + 1);
         Http::fakeSequence()->push('initial-body')->push('live-body');
-        Http::withBody($contents)->remember([10, 60])->post(self::API_URL);
+        Http::withBody($contents)->remember([10, 60], operation: 'read')->post(self::API_URL);
         $cached = Cache::store()->getStore()->all();
         config(['http-remember.max_request_bytes' => self::MAX_REQUEST_BYTES]);
         Carbon::setTestNow($start->copy()->addSeconds(10));
@@ -251,7 +251,7 @@ final class RequestSizeTest extends TestCase
         });
 
         // Apply the new request budget before cache access while leaving old entries to expire.
-        self::assertSame('live-body', Http::withBody($contents)->remember([10, 60])->post(self::API_URL)->body());
+        self::assertSame('live-body', Http::withBody($contents)->remember([10, 60], operation: 'read')->post(self::API_URL)->body());
         self::assertSame($cached, Cache::store()->getStore()->all());
         self::assertCount(0, app(DeferredCallbackCollection::class));
         self::assertCount(1, $events);
@@ -270,16 +270,16 @@ final class RequestSizeTest extends TestCase
         config(['http-remember.max_request_bytes' => self::MAX_REQUEST_BYTES]);
         Http::fakeSequence()->push('cached-body')->push('live-body');
         $contents = str_repeat('x', self::MAX_REQUEST_BYTES);
-        $pending = Http::withBody($contents)->remember(60);
+        $pending = Http::withBody($contents)->remember(60, operation: 'read');
         config(['http-remember.max_request_bytes' => self::MAX_REQUEST_BYTES - 1]);
 
         // Keep the existing builder's policy while new builders enforce the smaller limit.
         self::assertSame('cached-body', $pending->post(self::API_URL)->body());
-        self::assertSame('live-body', Http::withBody($contents)->remember(60)->post(self::API_URL)->body());
+        self::assertSame('live-body', Http::withBody($contents)->remember(60, operation: 'read')->post(self::API_URL)->body());
 
         // Reuse the original entry after increasing the budget without changing its identity.
         config(['http-remember.max_request_bytes' => self::MAX_REQUEST_BYTES + 1]);
-        self::assertSame('cached-body', Http::withBody($contents)->remember(60)->post(self::API_URL)->body());
+        self::assertSame('cached-body', Http::withBody($contents)->remember(60, operation: 'read')->post(self::API_URL)->body());
         Http::assertSentCount(2);
     }
 
@@ -338,7 +338,7 @@ final class RequestSizeTest extends TestCase
         $start = Carbon::parse('2026-01-01 12:00:00');
         Carbon::setTestNow($start);
         Http::fakeSequence()->push('initial-body');
-        Http::withBody('query')->remember([10, 60])->post(self::API_URL);
+        Http::withBody('query')->remember([10, 60], operation: 'read')->post(self::API_URL);
         Carbon::setTestNow($start->copy()->addSeconds(10));
         $body = null;
         app('events')->listen(RequestSending::class, static function (RequestSending $event) use (&$body): void {
@@ -351,7 +351,7 @@ final class RequestSizeTest extends TestCase
         });
 
         // Keep the cached response while cancelling the oversized refresh and restoring the cursor.
-        self::assertSame('initial-body', Http::withBody('query')->remember([10, 60])->post(self::API_URL)->body());
+        self::assertSame('initial-body', Http::withBody('query')->remember([10, 60], operation: 'read')->post(self::API_URL)->body());
         self::assertSame(self::MAX_REQUEST_BYTES + 1, $body->tell());
         self::assertCount(0, app(DeferredCallbackCollection::class));
         self::assertSame('refresh_skipped', $events[1]->event);
@@ -400,7 +400,7 @@ final class RequestSizeTest extends TestCase
     {
         // Keep request mutation and Laravel's hit bookkeeping outside the stream-focused tests.
         return new HttpRememberMiddleware(
-            new HttpRememberOptions($ttl, null, 15, maxRequestBytes: $maxRequestBytes),
+            new HttpRememberOptions($ttl, null, 15, operation: 'read', maxRequestBytes: $maxRequestBytes),
             static fn (): bool => true,
             static function (): void {},
         );

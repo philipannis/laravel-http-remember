@@ -72,8 +72,8 @@ final readonly class HttpRememberOptions
      * @param  int|array{int, int}  $ttl  A positive lifetime or [fresh, total lifetime].
      * @param  string|null  $store  A configured Laravel cache store, or the default store.
      * @param  int  $refreshTimeout  The maximum deferred network timeout in seconds.
-     * @param  list<string>|null  $group  The complete invalidation group; null or an empty list disables grouping.
-     * @param  'read'|null  $operation  Read caches any eligible method; null uses automatic detection.
+     * @param  list<string>|null  $group  The complete invalidation group. Null or an empty list disables grouping.
+     * @param  'read'|null  $operation  Explicit read intent, or null for automatic method detection.
      * @param  (callable(Response): bool)|null  $cacheWhen  An optional response eligibility predicate.
      * @param  list<string>  $ignoredHeaders  Request header names excluded from cache fingerprints.
      * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.

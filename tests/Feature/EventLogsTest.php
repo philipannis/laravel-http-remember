@@ -53,7 +53,7 @@ final class EventLogsTest extends TestCase
         self::assertSame(['miss', 'stored'], $this->eventNames($eventLogs));
         self::assertSame('missing', $eventLogs[0]->reason);
         self::assertSame('array', $eventLogs[0]->store);
-        self::assertMatchesRegularExpression('/^http-remember:[a-f0-9]{64}$/', $eventLogs[0]->cacheKey);
+        self::assertMatchesRegularExpression('/^http-remember:v2:[a-f0-9]{64}$/', $eventLogs[0]->cacheKey);
         self::assertSame('initial-body', $live->body());
 
         // Include fractional seconds in the fresh hit's event log.
@@ -64,7 +64,7 @@ final class EventLogsTest extends TestCase
         self::assertSame('fresh', $eventLogs[2]->reason);
         self::assertSame(1.25, $eventLogs[2]->age);
         self::assertSame($eventLogs[0]->cacheKey, $eventLogs[2]->cacheKey);
-        self::assertSame(['X-Upstream' => ['original']], $fresh->headers());
+        self::assertSame(['X-Upstream' => ['original'], 'Age' => ['1']], $fresh->headers());
         self::assertSame('initial-body', $fresh->body());
 
         // Record the stale hit before deferred execution replaces its cache entry.
@@ -427,7 +427,7 @@ final class EventLogsTest extends TestCase
 
         // Allow useful correlation without logging plaintext request or response contents.
         foreach ($eventLogs as $eventLog) {
-            self::assertMatchesRegularExpression('/^http-remember:[a-f0-9]{64}$/', $eventLog->cacheKey);
+            self::assertMatchesRegularExpression('/^http-remember:v2:[a-f0-9]{64}$/', $eventLog->cacheKey);
             self::assertSame(hash('sha256', serialize(['private-tenant'])), $eventLog->groupHash);
             self::assertStringNotContainsString('private-', json_encode($eventLog->toArray()));
             self::assertStringNotContainsString(self::API_URL, json_encode($eventLog->toArray()));
@@ -638,7 +638,7 @@ final class EventLogsTest extends TestCase
         );
         Http::fakeSequence()->push('private-response');
 
-        self::assertSame('private-response', Http::remember(60)->send($method, $url)->body());
+        self::assertSame('private-response', Http::remember(60, operation: 'read')->send($method, $url)->body());
     }
 
     /**
@@ -687,7 +687,7 @@ final class EventLogsTest extends TestCase
         $startedAt = Carbon::parse('2026-01-01 12:00:00');
         Carbon::setTestNow($startedAt);
         Http::fakeSequence()->push('first')->push('second')->push('refreshed-first')->push('refreshed-second');
-        $pending = Http::remember([10, 60]);
+        $pending = Http::remember([10, 60], operation: 'read');
         $firstUrl = 'https://www.first.example.test/products';
         $secondUrl = 'https://www.second.example.test/categories?token=private-query#private-fragment';
         $pending->post($firstUrl);

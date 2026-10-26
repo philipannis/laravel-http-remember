@@ -213,6 +213,44 @@ final class MiddlewareTest extends TestCase
     }
 
     /**
+     * Confirm overlapping freshness checks preserve a replacement even when its upstream age is high.
+     */
+    public function test_overlapping_freshness_requests_do_not_overwrite_newer_generations(): void
+    {
+        // Hold two live transfers after they both reject the same older cached response.
+        Carbon::setTestNow('2026-01-01 12:00:00');
+        $firstTransfer = new Promise;
+        $secondTransfer = new Promise;
+        $transfers = [Create::promiseFor(new Response(200, ['Age' => '10'], 'initial')), $firstTransfer, $secondTransfer];
+        $handler = $this->middleware()(
+            /**
+             * Supply controlled responses so the later request can complete first.
+             */
+            static function () use (&$transfers): PromiseInterface {
+                // Each network invocation consumes exactly one prepared transfer.
+                return array_shift($transfers);
+            },
+        );
+
+        // Seed the shared representation and start both stricter reads before either can finish.
+        $request = new Request('GET', self::API_URL);
+        $handler($request, [])->wait();
+        $stricter = $request->withHeader('Cache-Control', 'max-age=5');
+        $first = $handler($stricter, []);
+        $second = $handler($stricter, []);
+
+        // Neither live answer satisfies the requested age, but the first completed write still wins.
+        $secondTransfer->resolve(new Response(200, ['Age' => '10'], 'newer-response'));
+        self::assertSame('newer-response', (string) $second->wait()->getBody());
+        $firstTransfer->resolve(new Response(200, ['Age' => '10'], 'older-response'));
+        self::assertSame('older-response', (string) $first->wait()->getBody());
+
+        // An ordinary reader can reuse the newer response under the application's lifetime policy.
+        self::assertSame('newer-response', (string) $handler($request, [])->wait()->getBody());
+        self::assertSame([], $transfers);
+    }
+
+    /**
      * Confirm another writer cannot interleave between the cache check and persistence.
      */
     public function test_overlapping_cache_writes_do_not_interleave(): void
