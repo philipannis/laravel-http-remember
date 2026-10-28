@@ -29,7 +29,7 @@ Use `group` to invalidate related cached reads after a live mutation or with `in
 Requires PHP 8.2+ with Laravel 12, or PHP 8.3+ with Laravel 13.
 
 ```bash
-composer require "philipannis/laravel-http-remember:^1.0"
+composer require philipannis/laravel-http-remember
 ```
 
 Then add `remember()` before sending a request.
