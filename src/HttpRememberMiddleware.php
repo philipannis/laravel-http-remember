@@ -449,6 +449,19 @@ final class HttpRememberMiddleware
             return 'mutation';
         }
 
+        // Leave disallowed schemes and malformed protocol policies to Guzzle's live validation path.
+        $protocols = $options['protocols'] ?? ['http', 'https'];
+        if (! is_array($protocols) || ! in_array($request->getUri()->getScheme(), $protocols, true)) {
+            return 'protocols';
+        }
+
+        // Match Guzzle's supported values without requiring helpers absent from older supported versions.
+        foreach ($protocols as $protocol) {
+            if (! in_array($protocol, ['http', 'https'], true)) {
+                return 'protocols';
+            }
+        }
+
         // Honor request cache restrictions before reading a body or looking up a stored response.
         if (($reason = HttpRememberCachePolicy::requestBypassReason($request)) !== null) {
             return $reason;

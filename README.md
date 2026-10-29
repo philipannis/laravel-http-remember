@@ -523,7 +523,7 @@ Event::listen(HttpRememberEventLog::class, function (HttpRememberEventLog $event
 
 Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age`, `status`, `operation`, `exception`, and `retryAt`. Unavailable fields are `null`. Cooldown skips include `retryAt` as the next permitted refresh's Unix timestamp. `toArray()` uses `cache_key`, `group_hash`, and `retry_at` for log context. Keys and groups are hashed. Records omit query strings, fragments, credentials, headers, bodies, and exception messages. The method, hostname, and path appear only in the log message. Enabled event logs use the `debug` log level.
 
-Request bypass reasons include `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `request_size`, `request_cache_control`, `request_conditional`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `request_freshness`, `only_if_cached`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `response_cache_control`, `response_cookie`, `response_partial`, `response_expired`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `request_size`, `refresh_lock_unavailable`, or `cooldown`.
+Request bypass reasons include `protocols`, `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `request_size`, `request_cache_control`, `request_conditional`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `request_freshness`, `only_if_cached`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `response_cache_control`, `response_cookie`, `response_partial`, `response_expired`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `request_size`, `refresh_lock_unavailable`, or `cooldown`.
 
 Stale hits outside cooldown emit `refresh_scheduled` unless the request is `only-if-cached`, while Laravel deduplicates actual execution by callback name. Hits during cooldown emit `refresh_skipped` instead. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
 
@@ -592,6 +592,8 @@ Add custom Guzzle middleware **before** `remember()` so the cache key includes i
 
 Use Laravel's normal client stack. A client passed to `setClient()` controls its own middleware, so `remember()` cannot install itself into that client's handler stack.
 
+The Guzzle `protocols` option is checked before cache lookup and at every redirect destination, including deferred refreshes. For example, `withOptions(['protocols' => ['https']])` cannot reuse a cached HTTP response. Disallowed schemes and malformed protocol lists bypass caching so the live handler retains its normal validation behavior. When `only-if-cached` forbids a live transfer, these requests return HTTP 504 instead. Allowed schemes continue sharing the ordinary response cache entry. Omitting `protocols` or setting it to `null` permits HTTP and HTTPS.
+
 ### Requests that bypass caching
 
 These requests skip caching even when a matching cached response already exists.
@@ -599,6 +601,7 @@ These requests skip caching even when a matching cached response already exists.
 | Request feature | Reason |
 | --- | --- |
 | Mutation methods without `operation: 'read'` | They must execute every time and must never be repeated by a refresh. |
+| A scheme excluded by `protocols`, or a malformed protocol list | Cached responses must not bypass the live handler's protocol restrictions. |
 | Request `no-store`, `no-cache`, `max-age=0`, or legacy `Pragma: no-cache` | The caller requires a live transfer. |
 | Conditional or range request headers | The origin must evaluate the caller's validators and requested byte range. |
 | Custom `beforeSending()` callbacks | They can change the request after its key is calculated. |
