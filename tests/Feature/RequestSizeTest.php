@@ -329,6 +329,64 @@ final class RequestSizeTest extends TestCase
     }
 
     /**
+     * Confirm Laravel's callback inspection cannot restore unbounded duplicate upload retention.
+     */
+    public function test_inspecting_callbacks_keeps_duplicate_upload_memory_bounded(): void
+    {
+        // Reuse one large request so memory measurements isolate deferred copies from HTTP builders.
+        $start = Carbon::parse('2026-01-01 12:00:00');
+        Carbon::setTestNow($start);
+        $contents = str_repeat('x', 900_000);
+        $sent = 0;
+        $handler = $this->middleware([1, 60], strlen($contents))(
+            /**
+             * Verify the complete upload while leaving its cursor ready for repeated requests.
+             */
+            static function (RequestInterface $request) use ($contents, &$sent): PromiseInterface {
+                // Check both the foreground body and the independently captured refresh body.
+                $body = $request->getBody();
+                $position = $body->tell();
+                self::assertSame($contents, (string) $body);
+                $body->seek($position);
+
+                // Make any unexpected live transfer observable through the response version.
+                return Create::promiseFor(new Response(200, [], (string) ++$sent));
+            },
+        );
+        // Match Guzzle's prepared headers so the refresh retains the original request's identity.
+        $request = new Request('POST', self::API_URL, [
+            'Content-Length' => (string) strlen($contents),
+            'Content-Type' => 'text/plain',
+        ], $contents);
+        $handler($request, [])->wait();
+        Carbon::setTestNow($start->copy()->addSecond());
+        $handler($request, [])->wait();
+
+        // Counting normalizes Laravel's collection keys before later stale requests replace their slot.
+        $callbacks = app(DeferredCallbackCollection::class);
+        self::assertCount(1, $callbacks);
+        memory_reset_peak_usage();
+        $before = memory_get_usage();
+
+        // Repeated scheduling must remain bounded even after that framework normalization.
+        for ($attempt = 0; $attempt < 100; $attempt++) {
+            // Preserve the stale result without invoking the transport or inspecting the queue.
+            self::assertSame('1', (string) $handler($request, [])->wait()->getBody());
+        }
+
+        // Allow transient replacement copies while rejecting growth proportional to the request count.
+        self::assertLessThan(4 * 1024 * 1024, memory_get_peak_usage() - $before);
+        self::assertSame(1, $sent);
+        self::assertSame(0, $request->getBody()->tell());
+
+        // Execute the latest copy once and confirm the refreshed response remains reusable.
+        $callbacks->invoke();
+        self::assertSame('2', (string) $handler($request, [])->wait()->getBody());
+        self::assertSame(2, $sent);
+        self::assertCount(0, $callbacks);
+    }
+
+    /**
      * Confirm request events cannot enlarge a deferred copy beyond the configured budget.
      */
     public function test_refresh_rechecks_bodies_changed_by_request_events(): void

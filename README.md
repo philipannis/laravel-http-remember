@@ -525,7 +525,7 @@ Each event log exposes `event`, `cacheKey`, `store`, `groupHash`, `reason`, `age
 
 Request bypass reasons include `protocols`, `request_hooks`, `on_headers`, `on_trailers`, `stream`, `sink`, `curl`, `stream_context`, `multipart`, `request_body`, `request_size`, `request_cache_control`, `request_conditional`, `mutation`, and `cache_read_failed`. Miss reasons include `missing`, `invalid_entry`, `expired`, `request_freshness`, `only_if_cached`, `group_invalidated`, and `vary`. Storage reasons include `response_status`, `response_stream`, `response_size`, `response_predicate`, `response_cache_control`, `response_cookie`, `response_partial`, `response_expired`, `vary`, `group_invalidated`, `generation_changed`, `write_lock_unavailable`, and `cache_write_failed`. Refresh cancellation can also report `expired`, `request_hooks`, `request_size`, `refresh_lock_unavailable`, or `cooldown`.
 
-Stale hits outside cooldown emit `refresh_scheduled` unless the request is `only-if-cached`, while Laravel deduplicates actual execution by callback name. Hits during cooldown emit `refresh_skipped` instead. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
+Stale hits outside cooldown emit `refresh_scheduled` unless the request is `only-if-cached`, while pending refreshes are replaced by name and Laravel deduplicates actual execution. Hits during cooldown emit `refresh_skipped` instead. Count `refresh_started` and the final refresh outcome to measure refresh work. Listener and log-channel exceptions are contained so they do not replace HTTP responses, change cache lifetimes, or interfere with invalidation.
 
 ## Refreshes and failures
 
@@ -574,7 +574,7 @@ A refresh replaces only the generation it started with. Removing that cache entr
 
 Group invalidation cancels pending refreshes and prevents older in-flight reads or refreshes from populating the replacement group generation. An in-flight request still returns its live result to its own caller. Cache failures during invalidation are logged without replacing the mutation's original response.
 
-When several callers request stale data, the package deduplicates callbacks within the current request, command, or job. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently.
+When several callers request stale data, the package replaces pending refreshes within the current request, command, or job so duplicate request-body copies do not accumulate until termination. The latest successfully prepared request supplies the refresh body and settings. If preparing its replacement fails, the earlier refresh remains queued. Laravel deduplicates execution by callback name. Use a shared cache store with atomic locks to coordinate refreshes across servers. Stores without locks still cache responses, but separate workers may refresh independently.
 
 Synchronous cache misses use best-effort deduplication on stores with atomic locks. A competing caller waits up to one second, then rechecks the cache. If no usable response is available, it sends its own request, so slow calls can still overlap. Use a shared cache store to coordinate across processes or servers. Async requests, pools, and stores without atomic locks skip miss deduplication.
 

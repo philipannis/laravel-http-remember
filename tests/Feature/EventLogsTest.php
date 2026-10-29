@@ -108,7 +108,7 @@ final class EventLogsTest extends TestCase
         Http::remember([10, 60])->get(self::API_URL);
         Http::remember([10, 60])->get(self::API_URL);
 
-        // Scheduling requests remain observable while execution is deduplicated by Laravel.
+        // Scheduling requests remain observable while their pending refresh is replaced.
         self::assertSame(['miss', 'stored', 'hit', 'hit', 'refresh_scheduled', 'hit', 'refresh_scheduled'], $this->eventNames($eventLogs));
         self::assertSame('fresh', $eventLogs[2]->reason);
         self::assertSame('stale', $eventLogs[3]->reason);

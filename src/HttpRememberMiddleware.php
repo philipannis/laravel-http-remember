@@ -20,6 +20,7 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Http\Response as HttpStatus;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Defer\DeferredCallback;
 use Illuminate\Support\Facades\Cache;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
@@ -894,8 +895,8 @@ final class HttpRememberMiddleware
             $key,
         ]));
 
-        // Refresh after the lifecycle completes, including unsuccessful requests and jobs.
-        defer(
+        // Replace the named queue slot immediately without reindexing unrelated deferred work.
+        defer()[$name] = new DeferredCallback(
             /**
              * Refresh the stale generation while retaining it on upstream failures.
              *
@@ -972,9 +973,10 @@ final class HttpRememberMiddleware
                 }
             },
             $name,
-        )->always();
+            always: true,
+        );
 
-        // Schedule refreshes on stale hits and let Laravel deduplicate execution by callback name.
+        // Keep every eligible stale hit observable while pending refresh copies remain bounded.
         $eventLog('refresh_scheduled', $key, ['age' => $generation->age()]);
     }
 
