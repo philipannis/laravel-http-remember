@@ -117,8 +117,15 @@ final readonly class HttpRememberCachePolicy
             return false;
         }
 
-        // A minimum freshness requirement also rules out already stale responses.
+        // Measure remaining freshness against the stored origin limit and application policy.
         $freshRemaining = $cached->freshFor($settings->fresh) - $cached->age();
+
+        // Fixed policies must reject stale entries retained before their storage rules changed.
+        if ($settings->fresh === $settings->lifetime && $freshRemaining <= 0) {
+            return false;
+        }
+
+        // A minimum freshness requirement also rules out already stale responses.
         if (isset($directives['min-fresh'])
             && ($freshRemaining <= 0 || $freshRemaining < self::seconds($directives['min-fresh']))) {
             return false;
@@ -209,8 +216,9 @@ final readonly class HttpRememberCachePolicy
             $lifetime = min($lifetime, $fresh + $durations['stale-while-revalidate']);
         }
 
-        // Mandatory validation and shared max-age never permit stale responses from this cache.
-        if (isset($directives['must-revalidate']) || isset($directives['proxy-revalidate']) || isset($directives['s-maxage'])) {
+        // End fixed policies at effective freshness and honor mandatory origin validation.
+        if ($settings->fresh === $settings->lifetime
+            || isset($directives['must-revalidate']) || isset($directives['proxy-revalidate']) || isset($directives['s-maxage'])) {
             $lifetime = min($lifetime, $fresh);
         }
 

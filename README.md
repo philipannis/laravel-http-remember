@@ -70,7 +70,7 @@ $response = Http::remember(3600)
 
 The first request waits for the API. If the response is eligible, matching requests can reuse it for up to one hour. An earlier expiry supplied by the API takes precedence. After expiry, the next request waits for the API again and starts a new lifetime if its response is eligible.
 
-Reading from the cache doesn't extend its lifetime. There are no deferred refreshes in this mode.
+Reading from the cache doesn't extend its lifetime. There are no deferred refreshes in this mode. Fixed lifetimes end at effective freshness, even when the API supplies `stale-while-revalidate`.
 
 ### Stale-while-revalidate (default)
 
@@ -102,7 +102,7 @@ HTTP cache rules apply automatically to both cache modes. You do not need to pub
 | `max-age=N` | Limit use to the remaining origin freshness, after accounting for `Date` and `Age`. |
 | `s-maxage=N` | Use this limit ahead of `max-age` or `Expires`, and require a live response when stale. |
 | `Expires` | Use its deadline when neither `s-maxage` nor `max-age` is present. |
-| `stale-while-revalidate=N` | Allow at most this many stale seconds, within the configured total lifetime. |
+| `stale-while-revalidate=N` | In stale-while-revalidate mode, allow at most this many stale seconds within the configured total lifetime. |
 | `must-revalidate` or `proxy-revalidate` | Require a live response once the effective fresh period ends. Stale data is never served. |
 | `Vary: *`, or `Vary` on an omitted request header | Do not store a response whose variants cannot be distinguished. |
 | Malformed or duplicate lifetime directives, invalid dates or ages, or `must-understand` | Skip storage rather than guess how the response may be reused. |

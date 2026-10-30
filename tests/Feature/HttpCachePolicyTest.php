@@ -193,6 +193,123 @@ final class HttpCachePolicyTest extends TestCase
     }
 
     /**
+     * Confirm origin stale allowances cannot turn a fixed lifetime into deferred refreshing.
+     *
+     * @param  array<string, string>  $headers  Origin freshness fields with permission to serve stale data.
+     * @param  bool  $async  Whether the caller receives response promises.
+     */
+    #[DataProvider('fixedPolicyStaleAllowances')]
+    public function test_fixed_policies_expire_at_origin_freshness_without_deferred_refreshes(array $headers, bool $async): void
+    {
+        // Freeze receipt time and prepare a distinct response for the next foreground fetch.
+        $started = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($started);
+        Http::fakeSequence()->push('initial', 200, $headers)->push('updated');
+        $pending = Http::async($async)->remember(60);
+
+        // Populate the fixed entry while preserving the caller's normal response contract.
+        $initial = $pending->get(self::API_URL);
+        self::assertSame('initial', ($async ? $initial->wait() : $initial)->body());
+        $cache = Cache::store();
+        $key = array_key_first($cache->getStore()->all());
+
+        // Reuse the response before effective freshness ends without scheduling any refresh.
+        Carbon::setTestNow($started->copy()->addSeconds(9));
+        $fresh = $pending->get(self::API_URL);
+        self::assertSame('initial', ($async ? $fresh->wait() : $fresh)->body());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(1);
+
+        // End backend retention with freshness instead of keeping a deferred refresh generation.
+        Carbon::setTestNow($started->copy()->addSeconds(10));
+        self::assertNull($cache->get($key));
+
+        // Fetch and retain the replacement immediately when the origin's fresh period ends.
+        $expired = $pending->get(self::API_URL);
+        self::assertSame('updated', ($async ? $expired->wait() : $expired)->body());
+        $remembered = $pending->get(self::API_URL);
+        self::assertSame('updated', ($async ? $remembered->wait() : $remembered)->body());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Provide origin freshness limits that previously introduced stale use into fixed policies.
+     *
+     * @return iterable<string, array{array<string, string>, bool}> Origin fields and execution modes.
+     */
+    public static function fixedPolicyStaleAllowances(): iterable
+    {
+        // Cover immediate responses and promises for maximum-age, expiration, and upstream age limits.
+        foreach ([false, true] as $async) {
+            $mode = $async ? 'asynchronous' : 'synchronous';
+            yield 'maximum age '.$mode => [['Cache-Control' => 'max-age=10, stale-while-revalidate=50'], $async];
+            yield 'expires '.$mode => [[
+                'Cache-Control' => 'stale-while-revalidate=50',
+                'Date' => 'Thu, 01 Jan 2026 12:00:00 GMT',
+                'Expires' => 'Thu, 01 Jan 2026 12:00:10 GMT',
+            ], $async];
+            yield 'upstream age '.$mode => [[
+                'Cache-Control' => 'max-age=20, stale-while-revalidate=50',
+                'Age' => '10',
+            ], $async];
+        }
+    }
+
+    /**
+     * Confirm fixed policies reject responses that arrive stale even when the origin permits stale use.
+     */
+    public function test_fixed_policies_do_not_store_already_stale_responses(): void
+    {
+        // Permit stale origin reuse while making the response's fresh lifetime already exhausted.
+        Carbon::setTestNow(self::STARTED_AT);
+        $headers = ['Cache-Control' => 'max-age=10, stale-while-revalidate=50', 'Age' => '10'];
+        Http::fakeSequence()->push('first', 200, $headers)->push('second', 200, $headers);
+
+        // Honor an integer default policy without retaining either response or scheduling work.
+        config(['http-remember.ttl_seconds' => 60]);
+        self::assertSame('first', Http::remember()->get(self::API_URL)->body());
+        self::assertSame('second', Http::remember()->get(self::API_URL)->body());
+        self::assertSame([], Cache::store()->getStore()->all());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(2);
+    }
+
+    /**
+     * Confirm fixed policies replace stale entries retained before their freshness cap was enforced.
+     */
+    public function test_fixed_policies_reject_and_replace_previously_stored_stale_entries(): void
+    {
+        // Populate the fixed request key before simulating metadata written by an older version.
+        $started = Carbon::parse(self::STARTED_AT);
+        Carbon::setTestNow($started);
+        Http::fakeSequence()->push('initial')->push('updated');
+        Http::remember(60)->get(self::API_URL);
+        $cache = Cache::store();
+        $key = array_key_first($cache->getStore()->all());
+        $payload = $cache->get($key);
+
+        // Retain the old generation beyond freshness without extending its configured total lifetime.
+        $payload['fresh'] = 10.0;
+        $payload['lifetime'] = 60.0;
+        $cache->put($key, $payload, 60);
+        Carbon::setTestNow($started->copy()->addSeconds(10));
+
+        // A cache-only request must reject the stale entry without starting foreground or deferred work.
+        $cacheOnly = Http::async()->withHeaders(['Cache-Control' => 'only-if-cached, max-stale'])->remember(60)->get(self::API_URL)->wait();
+        self::assertSame(504, $cacheOnly->status());
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(1);
+
+        // Replace the retained stale generation so later fixed reads reuse the new live response.
+        self::assertSame('updated', Http::async()->remember(60)->get(self::API_URL)->wait()->body());
+        self::assertSame('updated', Http::remember(60)->get(self::API_URL)->body());
+        self::assertNotSame($payload['id'], $cache->get($key)['id']);
+        self::assertCount(0, app(DeferredCallbackCollection::class));
+        Http::assertSentCount(2);
+    }
+
+    /**
      * Confirm an origin-provided stale window controls both refresh scheduling and hard expiry.
      */
     public function test_origin_stale_window_is_bounded_by_its_own_deadline(): void
