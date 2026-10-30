@@ -17,7 +17,7 @@ use RuntimeException;
  *
  * @internal
  *
- * @phpstan-type Payload array{id: string, stored_at: int|float, status: int, headers: array<string, list<string>>, body: string, protocol: string, reason: string}
+ * @phpstan-type Payload array{id: string, stored_at: int|float, status: int, headers: array<string, list<string>>, body: string, protocol: string, reason: string, fresh?: float|null, lifetime?: float|null, initial_age?: float}
  */
 final class HttpRememberResponse
 {
@@ -34,11 +34,12 @@ final class HttpRememberResponse
      * @param  ResponseInterface  $response  The response returned by the next handler.
      * @param  int  $maxResponseBytes  The maximum cached response body size in bytes.
      * @param  string|null  $reason  The reason capture was skipped, when requested.
+     * @param  HttpRememberCachePolicy|null  $policy  The origin's restrictions, evaluated before capture.
      * @return self|null The captured response, or null when it cannot be cached.
      *
      * @throws RuntimeException When the response stream cannot be read or restored.
      */
-    public static function capture(ResponseInterface $response, int $maxResponseBytes = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES, ?string &$reason = null): ?self
+    public static function capture(ResponseInterface $response, int $maxResponseBytes = HttpRememberOptions::DEFAULT_MAX_RESPONSE_BYTES, ?string &$reason = null, ?HttpRememberCachePolicy $policy = null): ?self
     {
         // Reset diagnostics before checking this response's status and stream.
         $reason = null;
@@ -95,12 +96,15 @@ final class HttpRememberResponse
         // Record the lifetime from completion of the successful response.
         return new self([
             'id' => Str::random(),
-            'stored_at' => Carbon::now()->getPreciseTimestamp() / 1000000,
+            'stored_at' => $policy?->receivedAt ?? Carbon::now()->getPreciseTimestamp() / 1000000,
             'status' => $status,
             'headers' => $headers,
             'body' => $body,
             'protocol' => $response->getProtocolVersion(),
             'reason' => $response->getReasonPhrase(),
+            'fresh' => $policy?->fresh,
+            'lifetime' => $policy?->lifetime,
+            'initial_age' => $policy?->initialAge ?? 0.0,
         ]);
     }
 
@@ -125,13 +129,32 @@ final class HttpRememberResponse
             return null;
         }
 
-        // Require header names and lists of values to contain only strings.
+        // Require header names and non-empty lists of string values.
         foreach ($data['headers'] as $name => $values) {
             // Reject malformed headers before reconstructing the cached response.
-            if (! is_string($name) || ! is_array($values) || ! array_is_list($values)
+            if (! is_string($name) || ! is_array($values) || $values === [] || ! array_is_list($values)
                 || array_filter($values, 'is_string') !== $values) {
                 return null;
             }
+        }
+
+        // Reject invalid HTTP lifetime metadata before it can extend a cache entry's use.
+        foreach (['fresh', 'lifetime', 'initial_age'] as $field) {
+            if (isset($data[$field]) && ((! is_int($data[$field]) && ! is_float($data[$field]))
+                || ! is_finite($data[$field]) || $data[$field] < 0)) {
+                return null;
+            }
+        }
+        if (isset($data['fresh'], $data['lifetime']) && $data['fresh'] > $data['lifetime']) {
+            return null;
+        }
+
+        // Apply cache-hit HTTP validation without allocating another stream for the stored body.
+        try {
+            new Response($data['status'], $data['headers'], null, $data['protocol'], $data['reason']);
+        } catch (InvalidArgumentException) {
+            // Treat invalid HTTP metadata as a miss during reads and guarded replacement writes.
+            return null;
         }
 
         // Reuse the validated payload without storing live PHP objects in the cache.
@@ -141,13 +164,48 @@ final class HttpRememberResponse
     /**
      * Determine whether a response has reached the supplied age threshold.
      *
-     * @param  int  $seconds  The age threshold measured from the successful write.
+     * @param  int|float  $seconds  The age threshold measured from the successful write.
      * @return bool Whether the response is at least this old.
      */
-    public function hasReached(int $seconds): bool
+    public function hasReached(int|float $seconds): bool
     {
         // Compare ages without extending the entry's lifetime on cache hits.
         return Carbon::now()->getPreciseTimestamp() / 1000000 >= $this->data['stored_at'] + $seconds;
+    }
+
+    /**
+     * Limit freshness to the response policy captured when the origin answered.
+     *
+     * @param  int  $configured  The application's fresh threshold in seconds.
+     * @return float The effective fresh threshold measured from response receipt.
+     */
+    public function freshFor(int $configured): float
+    {
+        // A later application policy cannot extend an origin's stored freshness limit.
+        return min($configured, $this->data['fresh'] ?? $configured);
+    }
+
+    /**
+     * Limit total use to the response policy captured when the origin answered.
+     *
+     * @param  int  $configured  The application's total lifetime in seconds.
+     * @return float The effective hard expiry measured from response receipt.
+     */
+    public function lifetimeFor(int $configured): float
+    {
+        // Apply the origin's deadline even when the backend retains the generation longer.
+        return min($configured, $this->data['lifetime'] ?? $configured);
+    }
+
+    /**
+     * Include the response's age before it entered this cache.
+     *
+     * @return float The current HTTP age in seconds.
+     */
+    public function httpAge(): float
+    {
+        // Keep upstream Age and Date information from being reset on a cache hit.
+        return ($this->data['initial_age'] ?? 0.0) + $this->age();
     }
 
     /**
@@ -186,19 +244,23 @@ final class HttpRememberResponse
     /**
      * Build a new response with an independent body stream for each cache hit.
      *
+     * @param  bool  $withAge  Whether to expose the current HTTP age on a cache hit.
      * @return ResponseInterface A response ready for Laravel's normal response wrapper.
      *
      * @throws InvalidArgumentException When cached headers are invalid for PSR-7.
      */
-    public function toResponse(): ResponseInterface
+    public function toResponse(bool $withAge = false): ResponseInterface
     {
         // Preserve the upstream status, headers, body, protocol, and reason phrase.
-        return new Response(
+        $response = new Response(
             $this->data['status'],
             $this->data['headers'],
             $this->data['body'],
             $this->data['protocol'],
             $this->data['reason'],
         );
+
+        // Preserve raw headers for internal inspection while updating Age on delivered cache hits.
+        return $withAge ? $response->withHeader('Age', (string) min(2147483648.0, floor($this->httpAge()))) : $response;
     }
 }

@@ -188,10 +188,10 @@ final class RefreshCooldownTest extends TestCase
     public function test_custom_cooldowns_are_captured_when_remember_is_called(): void
     {
         // Retain a five-second policy even after the application changes its default.
-        config(['http-remember.refresh_cooldown' => 5]);
+        config(['http-remember.refresh_cooldown_seconds' => 5]);
         Http::fakeSequence()->push('initial')->push('unavailable', 503)->push('updated');
         $pending = Http::remember([10, 180]);
-        config(['http-remember.refresh_cooldown' => 60]);
+        config(['http-remember.refresh_cooldown_seconds' => 60]);
         $pending->get(self::API_URL);
         $this->at(10);
         $pending->get(self::API_URL);

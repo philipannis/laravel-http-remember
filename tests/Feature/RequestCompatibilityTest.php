@@ -61,9 +61,9 @@ final class RequestCompatibilityTest extends TestCase
     private const REFRESH_TIMEOUT_SECONDS = 15;
 
     /**
-     * Confirm independent callers can reuse a response without sharing newly issued cookies.
+     * Confirm responses issuing cookies reach each caller through a live request.
      */
-    public function test_responses_with_cookies_are_cached_without_populating_another_callers_jar(): void
+    public function test_responses_with_cookies_are_not_cached(): void
     {
         // Return a successful body alongside newly issued session and affinity cookies.
         Http::fake([
@@ -79,18 +79,19 @@ final class RequestCompatibilityTest extends TestCase
         $first = Http::withOptions(['cookies' => $firstJar])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
         $second = Http::withOptions(['cookies' => $secondJar])->remember(self::LIFETIME_SECONDS)->get(self::API_URL);
 
-        // Deliver newly issued cookies only to the caller that reached the upstream server.
+        // Each caller must receive the cookies issued by its own live upstream request.
         self::assertNotEmpty($first->header('Set-Cookie'));
         self::assertSame('first-session', $firstJar->getCookieByName('session')?->getValue());
         self::assertSame('first-server', $firstJar->getCookieByName('affinity')?->getValue());
-        self::assertSame('', $second->header('Set-Cookie'));
-        self::assertNull($secondJar->getCookieByName('session'));
-        self::assertNull($secondJar->getCookieByName('affinity'));
+        self::assertNotEmpty($second->header('Set-Cookie'));
+        self::assertSame('first-session', $secondJar->getCookieByName('session')?->getValue());
+        self::assertSame('first-server', $secondJar->getCookieByName('affinity')?->getValue());
 
-        // Reuse the cached body and ordinary headers without another upstream call.
+        // Preserve live bodies and ordinary headers without retaining session-issuing responses.
         self::assertSame($first->json(), $second->json());
         self::assertSame((string) self::INITIAL_VERSION, $second->header('X-Response-Version'));
-        Http::assertSentCount(1);
+        self::assertSame([], Cache::store()->getStore()->all());
+        Http::assertSentCount(2);
     }
 
     /**
@@ -118,16 +119,17 @@ final class RequestCompatibilityTest extends TestCase
     }
 
     /**
-     * Confirm deferred refreshes keep caching responses that issue new session cookies.
+     * Confirm deferred refreshes retire an older response when the origin begins issuing cookies.
      */
-    public function test_refreshed_responses_do_not_replay_new_session_cookies(): void
+    public function test_refreshed_session_responses_are_not_reused(): void
     {
-        // Freeze time and issue a different cookie with the initial and refreshed responses.
+        // Freeze time and issue a cookie only after the initial cacheable response.
         $startedAt = Carbon::parse(self::STARTED_AT);
         Carbon::setTestNow($startedAt);
         Http::fakeSequence()
-            ->push(['version' => self::INITIAL_VERSION], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=initial-session; Path=/'])
-            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=refreshed-session; Path=/']);
+            ->push(['version' => self::INITIAL_VERSION])
+            ->push(['version' => self::UPDATED_VERSION], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=refreshed-session; Path=/'])
+            ->push(['version' => 3], HttpStatus::HTTP_OK, ['Set-Cookie' => 'session=live-session; Path=/']);
 
         // Populate the cache before returning its stale response without issuing cookies.
         Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
@@ -135,16 +137,16 @@ final class RequestCompatibilityTest extends TestCase
         $stale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
         self::assertSame('', $stale->header('Set-Cookie'));
 
-        // Refresh the cached body and return it to a caller with a separate cookie jar.
+        // Refreshing must remove the old entry and leave the next caller on the live path.
         app(DeferredCallbackCollection::class)->invoke();
         $jar = new CookieJar;
         $refreshed = Http::withOptions(['cookies' => $jar])->remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->get(self::API_URL);
 
-        // Confirm the refreshed body was cached without adopting the refresh's session.
-        self::assertSame(self::UPDATED_VERSION, $refreshed->json('version'));
-        self::assertSame('', $refreshed->header('Set-Cookie'));
-        self::assertNull($jar->getCookieByName('session'));
-        Http::assertSentCount(2);
+        // The next caller receives its own response and session, never the deferred response's credentials.
+        self::assertSame(3, $refreshed->json('version'));
+        self::assertSame('session=live-session; Path=/', $refreshed->header('Set-Cookie'));
+        self::assertSame('live-session', $jar->getCookieByName('session')?->getValue());
+        Http::assertSentCount(3);
     }
 
     /**
@@ -181,13 +183,13 @@ final class RequestCompatibilityTest extends TestCase
             ->push(['result' => 'get'], HttpStatus::HTTP_OK);
 
         // Send two POST payloads and one GET request to the same URL.
-        $firstPost = Http::remember(self::LIFETIME_SECONDS)->post(self::API_URL, ['query' => 'first']);
-        $secondPost = Http::remember(self::LIFETIME_SECONDS)->post(self::API_URL, ['query' => 'second']);
+        $firstPost = Http::remember(self::LIFETIME_SECONDS, operation: 'read')->post(self::API_URL, ['query' => 'first']);
+        $secondPost = Http::remember(self::LIFETIME_SECONDS, operation: 'read')->post(self::API_URL, ['query' => 'second']);
         $get = Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
 
         // Repeat every representation to exercise its independent cache entry.
-        $firstPostAgain = Http::remember(self::LIFETIME_SECONDS)->post(self::API_URL, ['query' => 'first']);
-        $secondPostAgain = Http::remember(self::LIFETIME_SECONDS)->post(self::API_URL, ['query' => 'second']);
+        $firstPostAgain = Http::remember(self::LIFETIME_SECONDS, operation: 'read')->post(self::API_URL, ['query' => 'first']);
+        $secondPostAgain = Http::remember(self::LIFETIME_SECONDS, operation: 'read')->post(self::API_URL, ['query' => 'second']);
         $getAgain = Http::remember(self::LIFETIME_SECONDS)->get(self::API_URL);
 
         // Confirm the correct response stayed attached to every representation.
@@ -252,9 +254,9 @@ final class RequestCompatibilityTest extends TestCase
         );
 
         // Populate the initial response before scheduling a refresh from the stale cache hit.
-        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+        Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS], operation: 'read')->post(self::API_URL, $payload);
         Carbon::setTestNow($startedAt->copy()->addSeconds(self::FRESH_SECONDS));
-        $stale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+        $stale = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS], operation: 'read')->post(self::API_URL, $payload);
         self::assertSame(self::INITIAL_VERSION, $stale->json('version'));
         self::assertCount(1, app(DeferredCallbackCollection::class));
 
@@ -264,7 +266,7 @@ final class RequestCompatibilityTest extends TestCase
 
         // Execute the refresh and read its newly remembered response.
         app(DeferredCallbackCollection::class)->invoke();
-        $refreshed = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS])->post(self::API_URL, $payload);
+        $refreshed = Http::remember([self::FRESH_SECONDS, self::LIFETIME_SECONDS], operation: 'read')->post(self::API_URL, $payload);
 
         // Confirm both live transfers used the complete payload and matching content length.
         self::assertSame([

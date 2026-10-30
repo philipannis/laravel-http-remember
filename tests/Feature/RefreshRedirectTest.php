@@ -241,16 +241,16 @@ final class RefreshRedirectTest extends TestCase
         $pending->get(self::API_URL);
         app(DeferredCallbackCollection::class)->invoke();
 
-        // Keep deferred cookie changes out of the caller's jar and reuse only the matching destination.
+        // Keep deferred cookie changes out of the caller's jar and fetch session-issuing destinations live.
         self::assertSame('alice', $jar->getCookieByName('session')->getValue());
         self::assertSame('alice-private', Http::withOptions(['cookies' => $jar])->remember([10, 60])->get($destination)->body());
-        Http::assertSentCount(3);
+        Http::assertSentCount(4);
 
         // A caller with the same source identity must follow the redirect using its own session.
         $otherJar = CookieJar::fromArray(['session' => 'bob'], 'accounts.example.test');
         self::assertSame('bob-private', Http::withToken('source-token')->withOptions(['cookies' => $otherJar])
             ->remember([10, 60])->get(self::API_URL)->body());
-        Http::assertSentCount(5);
+        Http::assertSentCount(6);
     }
 
     /**

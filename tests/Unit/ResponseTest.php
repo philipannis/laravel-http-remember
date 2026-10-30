@@ -433,6 +433,28 @@ final class ResponseTest extends TestCase
     }
 
     /**
+     * Confirm HTTP validation preserves valid empty fields, multiple values, and extended text.
+     */
+    public function test_restore_preserves_valid_http_header_syntax(): void
+    {
+        // Include legal token punctuation, empty field values, tabs, and non-ASCII value bytes.
+        $response = new Response(HttpStatus::HTTP_OK, [
+            'X-Empty' => [''],
+            'X-Multiple' => ['first', "second\tvalue"],
+            "X-!#$%&'*+.^_`|~" => ["caf\xe9"],
+        ], 'response-body');
+        $captured = HttpRememberResponse::capture($response);
+        self::assertNotNull($captured);
+
+        // Reconstruct the same headers without rejecting valid data or changing the stored payload.
+        $restored = HttpRememberResponse::restore($captured->toArray());
+        self::assertNotNull($restored);
+        self::assertSame($captured->toArray(), $restored->toArray());
+        self::assertSame($response->getHeaders(), $restored->toResponse()->getHeaders());
+        self::assertSame('response-body', (string) $restored->toResponse()->getBody());
+    }
+
+    /**
      * Confirm untrusted malformed cache values are treated as misses.
      *
      * @param  mixed  $payload  The malformed cache value under test.
@@ -476,5 +498,23 @@ final class ResponseTest extends TestCase
         yield 'failed status' => [array_replace($valid, ['status' => HttpStatus::HTTP_SERVICE_UNAVAILABLE])];
         yield 'non-list header' => [array_replace($valid, ['headers' => ['X-Test' => [1 => 'value']]])];
         yield 'non-string header value' => [array_replace($valid, ['headers' => ['X-Test' => [123]]])];
+
+        // Reject HTTP syntax errors even when header names and values have the expected PHP types.
+        yield 'empty header name' => [array_replace($valid, ['headers' => ['' => ['value']]])];
+        yield 'space in header name' => [array_replace($valid, ['headers' => ['X Invalid' => ['value']]])];
+        yield 'colon in header name' => [array_replace($valid, ['headers' => ['X:Invalid' => ['value']]])];
+        yield 'newline in header name' => [array_replace($valid, ['headers' => ["X-Invalid\nInjected" => ['value']]])];
+        yield 'non-ascii header name' => [array_replace($valid, ['headers' => ["X-\xff" => ['value']]])];
+        yield 'empty header value list' => [array_replace($valid, ['headers' => ['X-Test' => []]])];
+        yield 'line break in header value' => [array_replace($valid, ['headers' => ['X-Test' => ["value\r\nInjected: value"]]])];
+        yield 'null byte in header value' => [array_replace($valid, ['headers' => ['X-Test' => ["value\x00"]]])];
+        yield 'control character in header value' => [array_replace($valid, ['headers' => ['X-Test' => ["value\x7f"]]])];
+
+        // Reject malformed HTTP freshness metadata rather than weakening the stored origin policy.
+        yield 'negative freshness' => [array_replace($valid, ['fresh' => -1.0])];
+        yield 'infinite lifetime' => [array_replace($valid, ['lifetime' => INF])];
+        yield 'non-numeric upstream age' => [array_replace($valid, ['initial_age' => '10'])];
+        yield 'negative upstream age' => [array_replace($valid, ['initial_age' => -1])];
+        yield 'freshness beyond lifetime' => [array_replace($valid, ['fresh' => 20.0, 'lifetime' => 10.0])];
     }
 }
