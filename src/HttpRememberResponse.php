@@ -129,10 +129,10 @@ final class HttpRememberResponse
             return null;
         }
 
-        // Require header names and lists of values to contain only strings.
+        // Require header names and non-empty lists of string values.
         foreach ($data['headers'] as $name => $values) {
             // Reject malformed headers before reconstructing the cached response.
-            if (! is_string($name) || ! is_array($values) || ! array_is_list($values)
+            if (! is_string($name) || ! is_array($values) || $values === [] || ! array_is_list($values)
                 || array_filter($values, 'is_string') !== $values) {
                 return null;
             }
@@ -146,6 +146,14 @@ final class HttpRememberResponse
             }
         }
         if (isset($data['fresh'], $data['lifetime']) && $data['fresh'] > $data['lifetime']) {
+            return null;
+        }
+
+        // Apply cache-hit HTTP validation without allocating another stream for the stored body.
+        try {
+            new Response($data['status'], $data['headers'], null, $data['protocol'], $data['reason']);
+        } catch (InvalidArgumentException) {
+            // Treat invalid HTTP metadata as a miss during reads and guarded replacement writes.
             return null;
         }
 
