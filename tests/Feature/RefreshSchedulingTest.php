@@ -178,8 +178,12 @@ final class RefreshSchedulingTest extends TestCase
             );
         }
 
-        // Drain the application callbacks and the refreshes they schedule in the same lifecycle.
+        // Invoke application work without assuming newly queued callbacks run in the same pass.
         $callbacks = app(DeferredCallbackCollection::class);
+        $callbacks->invoke();
+        self::assertSame($urls, $executed);
+
+        // Laravel 12 leaves nested work queued; Laravel 13 already drains it during the first pass.
         $callbacks->invoke();
         self::assertSame($urls, $executed);
 
