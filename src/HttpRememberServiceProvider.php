@@ -143,9 +143,24 @@ class HttpRememberServiceProvider extends ServiceProvider
                      * @return bool Whether all request mutations precede the cache layer.
                      */
                     function (): bool {
-                        // Laravel adds one internal callback. Any others can change the request.
-                        return $this->beforeSendingCallbacks->count() === HttpRememberServiceProvider::INTERNAL_BEFORE_SENDING_CALLBACK_COUNT
+                        // Exclude the package observer while rejecting application preparation callbacks.
+                        $internalCallbacks = HttpRememberServiceProvider::INTERNAL_BEFORE_SENDING_CALLBACK_COUNT
+                            + (int) in_array(HttpRememberRequestObserver::CALLBACK, $this->beforeSendingCallbacks->all(), true);
+
+                        // Laravel's internal callback and the observer do not change request identity.
+                        return $this->beforeSendingCallbacks->count() === $internalCallbacks
                             && $this->middleware->last() instanceof HttpRememberMiddleware;
+                    };
+
+                // Retain the callback collection shared by the builder and its clones.
+                $beforeSendingCallbacks = $this->beforeSendingCallbacks;
+                $prepareInvalidation =
+                    /**
+                     * Observe the final method without repeating Laravel's preparation callbacks.
+                     */
+                    static function () use ($beforeSendingCallbacks): void {
+                        // Reorder the observer before each transfer so newly added callbacks run first.
+                        HttpRememberRequestObserver::register($beforeSendingCallbacks);
                     };
 
                 // Preserve Laravel's request metadata and events on a cache hit.
@@ -163,7 +178,7 @@ class HttpRememberServiceProvider extends ServiceProvider
                     };
 
                 // Attach caching only to the request builder that opted in.
-                return $this->withMiddleware(new HttpRememberMiddleware($settings, $canCache, $onHit));
+                return $this->withMiddleware(new HttpRememberMiddleware($settings, $canCache, $onHit, $prepareInvalidation));
             },
         );
     }

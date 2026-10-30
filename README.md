@@ -615,7 +615,7 @@ These requests skip caching even when a matching cached response already exists.
 | Custom cURL options, including digest and NTLM authentication | They can change behavior outside the request used for the cache key. |
 | Custom `stream_context` options | They can override headers, bodies, or transport behavior outside the request used for the cache key. |
 
-Grouped mutations retain invalidation even when uploads, custom callbacks, or these other options bypass response caching.
+Grouped mutations retain invalidation even when uploads, custom callbacks, or these other options bypass response caching. Automatic invalidation uses the final method after middleware and `beforeSending()` callbacks: a GET changed to DELETE invalidates its group after a non-error response, while a mutation changed to GET preserves it. Explicit `operation: 'read'` continues to suppress automatic invalidation.
 
 Unreadable or non-seekable response bodies are also returned without being cached.
 

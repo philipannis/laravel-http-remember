@@ -77,11 +77,13 @@ final class HttpRememberMiddleware
      * @param  HttpRememberOptions  $settings  The cache lifetimes, store, group, operation intent, eligibility predicate, and ignored headers.
      * @param  Closure(): bool  $canCache  A guard against later request mutations.
      * @param  Closure(RequestInterface, array<string, mixed>): void  $onHit  Laravel's cache-hit bookkeeping.
+     * @param  (Closure(): void)|null  $prepareInvalidation  The optional final-request observer registration.
      */
     public function __construct(
         private readonly HttpRememberOptions $settings,
         private readonly Closure $canCache,
         private readonly Closure $onHit,
+        private readonly ?Closure $prepareInvalidation = null,
     ) {}
 
     /**
@@ -127,12 +129,24 @@ final class HttpRememberMiddleware
                 // A cache-only request must not reach the network, including on bypass or cache failure.
                 $onlyIfCached = HttpRememberCachePolicy::onlyIfCached($request);
 
+                // Track final methods independently for grouped transfers that allow automatic invalidation.
+                $observer = null;
+                if ($this->settings->groupHash !== null && ! $onlyIfCached
+                    && $this->settings->operation !== 'read' && $this->prepareInvalidation !== null) {
+                    ($this->prepareInvalidation)();
+                    $observer = new HttpRememberRequestObserver($request);
+                    $options[HttpRememberRequestObserver::OPTION] = $observer;
+                }
+
                 // Send grouped mutation methods live unless explicitly marked as read operations.
                 if ($this->settings->groupHash !== null
                     && ! $onlyIfCached
                     && $this->settings->operation !== 'read'
                     && ! in_array($request->getMethod(), ['GET', 'HEAD', 'OPTIONS', 'TRACE'], true)) {
-                    return $this->sendAndInvalidate($handler, $request, $options, $eventLog);
+                    // Classify the final prepared method before invalidating the live response's group.
+                    $eventLog('bypass', null, ['reason' => 'mutation']);
+
+                    return $this->sendAndInvalidate($handler, $request, $options, $eventLog, $observer);
                 }
 
                 // Bound request hashing before accessing the cache or copying a deferred upload.
@@ -143,6 +157,11 @@ final class HttpRememberMiddleware
                     // Report an unavailable representation without performing forbidden network work.
                     if ($onlyIfCached) {
                         return $this->cacheOnlyMiss($request, $options, $onHit, $eventLog);
+                    }
+
+                    // A bypassed read may become a mutation in later middleware or preparation callbacks.
+                    if ($this->settings->groupHash !== null && $this->settings->operation !== 'read') {
+                        return $this->sendAndInvalidate($handler, $request, $options, $eventLog, $observer);
                     }
 
                     return $this->sendLive($handler, $request, $options, null, $eventLog);
@@ -378,20 +397,19 @@ final class HttpRememberMiddleware
     }
 
     /**
-     * Send a grouped mutation and invalidate its group after a non-error response.
+     * Send a grouped transfer and invalidate successful final mutation methods.
      *
      * @param  Handler  $handler  The next handler in the outgoing request stack.
-     * @param  RequestInterface  $request  The mutation that must reach the API.
+     * @param  RequestInterface  $request  The request before later preparation hooks run.
      * @param  array<string, mixed>  $options  The original Guzzle transfer options.
      * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
+     * @param  HttpRememberRequestObserver|null  $observer  The final prepared request, when Laravel observes it.
      * @return PromiseInterface The unchanged live response or transport rejection.
      */
-    private function sendAndInvalidate(callable $handler, RequestInterface $request, array $options, Closure $eventLog): PromiseInterface
+    private function sendAndInvalidate(callable $handler, RequestInterface $request, array $options, Closure $eventLog, ?HttpRememberRequestObserver $observer = null): PromiseInterface
     {
-        // Grouped mutations run live and report their cache bypass explicitly.
-        $eventLog('bypass', null, ['reason' => 'mutation']);
-
         // Bind invalidation to the store selected before the mutation starts.
+        $store = $this->settings->store ?? config('cache.default');
         try {
             $cache = Cache::store($this->settings->store);
         } catch (Throwable $exception) {
@@ -409,11 +427,20 @@ final class HttpRememberMiddleware
              * @param  ResponseInterface  $response  The live upstream response.
              * @return ResponseInterface The original response received by the caller.
              */
-            function (ResponseInterface $response) use ($cache, $eventLog): ResponseInterface {
+            function (ResponseInterface $response) use ($cache, $eventLog, $request, $observer, $store): ResponseInterface {
+                // Preserve groups when later hooks changed an apparent mutation into a read.
+                $prepared = $observer?->request ?? $request;
+                if (in_array($prepared->getMethod(), ['GET', 'HEAD', 'OPTIONS', 'TRACE'], true)) {
+                    return $response;
+                }
+
                 // Invalidate redirects before their follow-up reads while preserving failed mutations.
                 if ($response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_BAD_REQUEST) {
                     return $response;
                 }
+
+                // Describe the actual mutation while retaining the store selected before request hooks ran.
+                $eventLog = $this->eventLogger($prepared, $store);
 
                 // Keep invalidation failures separate from the completed HTTP operation.
                 try {
