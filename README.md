@@ -21,7 +21,6 @@ Use `group` to invalidate related cached reads after a live mutation or with `in
 - [Refreshes and failures](#refreshes-and-failures)
 - [Request options and limits](#request-options-and-limits)
 - [Testing](#testing)
-- [Migrating from V1](#migrating-from-v1)
 - [License](#license)
 
 ## Installation
@@ -653,16 +652,6 @@ Http::assertSentCount(1);
 Use an isolated cache store for each test or clear the test cache during setup so a previous test's entries don't affect the result. Replacing an HTTP fake does not invalidate remembered responses.
 
 To test a stale refresh, advance Laravel's test clock into the stale period and make a cached request. Invoke `app(Illuminate\Support\Defer\DeferredCallbackCollection::class)->invoke()` before asserting the refreshed result. Advance to the original lifetime when checking that a failed refresh preserves the expiry.
-
-## Migrating from V1
-
-The default `ttl_seconds` is now `[60, 300]`, allowing up to one fresh minute and five minutes of total use. Published configuration must use `ttl_seconds`, `refresh_timeout_seconds`, and `refresh_cooldown_seconds` for durations. Rename the corresponding keys and update any `config()` calls that use their previous names.
-
-Review any `remember()` calls used with POST, PUT, PATCH, DELETE, or custom methods. They now run live unless you add `operation: 'read'`. Add that option only to searches, GraphQL queries, and other operations that are safe to skip and repeat. Leave it off real mutations. Grouped mutations still invalidate related reads after success.
-
-HTTP restrictions now apply automatically. APIs returning `no-store`, `no-cache`, `private`, or session cookies will no longer populate the cache, and origin freshness limits can shorten the lifetime selected by `ttl_seconds` or `remember()`. Use the event logs to see why a response was not stored.
-
-Response keys use a new namespace, so entries created under the previous permissive policy are not reused. Old entries expire normally, so there is no need to flush the cache. Group identities remain unchanged.
 
 ## License
 
