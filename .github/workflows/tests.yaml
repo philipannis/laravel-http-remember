@@ -37,6 +37,18 @@ jobs:
             laravel: '13'
             testbench: '11'
 
+    # Give each PHP and Laravel job its own disposable Redis service.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+
     steps:
       - name: Check out code
         uses: actions/checkout@v6
@@ -45,6 +57,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
+          extensions: redis
           coverage: none
           tools: composer:v2
         env:
@@ -80,6 +93,12 @@ jobs:
 
       - name: Run tests
         run: composer run test
+
+      # Run the two-worker checks using this job's runner-assigned Redis port.
+      - name: Test Redis worker coordination
+        env:
+          HTTP_REMEMBER_CI_REDIS_PORT: ${{ job.services.redis.ports[6379] }}
+        run: vendor/bin/phpunit tests/Integration/RedisConcurrencyTest.php
 
       - name: Check formatting
         run: composer run format:check
