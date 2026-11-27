@@ -48,9 +48,10 @@ final class RefreshRedirectTest extends TestCase
     #[DataProvider('requestModes')]
     public function test_refresh_follows_redirects_and_retires_the_old_source(bool $async): void
     {
-        // Keep the redirect live while making the destination independently cacheable.
+        // Give the redirect a no-store policy while the destination remains cacheable.
+        $redirectHeaders = ['Location' => '/catalog', 'Cache-Control' => 'no-store'];
         Http::fake([
-            self::API_URL => Http::sequence()->push('initial')->push('', 302, ['Location' => '/catalog'])->push('', 302, ['Location' => '/catalog']),
+            self::API_URL => Http::sequence()->push('initial')->push('', 302, $redirectHeaders)->push('', 302, $redirectHeaders),
             self::DESTINATION_URL => Http::response('updated'),
         ]);
 
@@ -100,8 +101,10 @@ final class RefreshRedirectTest extends TestCase
     #[DataProvider('restrictedRedirects')]
     public function test_redirect_failures_preserve_the_source(bool|array $redirects, string $location, int $sent): void
     {
-        // Include another redirect so the maximum-count policy can fail partway through a chain.
-        Http::fakeSequence()->push('initial')->push('', 302, ['Location' => $location])->push('', 302, ['Location' => '/final']);
+        // Start with a no-store redirect and include another hop that can exhaust the redirect limit.
+        Http::fakeSequence()->push('initial')
+            ->push('', 302, ['Location' => $location, 'Cache-Control' => 'no-store'])
+            ->push('', 302, ['Location' => '/final']);
 
         // Capture the original payload and expiry under the caller's redirect restrictions.
         $pending = Http::withOptions(['allow_redirects' => $redirects])->remember([10, 60]);
@@ -349,17 +352,22 @@ final class RefreshRedirectTest extends TestCase
     }
 
     /**
-     * Confirm a destination failure retains the source and applies the final response's cooldown.
+     * Confirm a destination failure retains both entries and applies the final response's cooldown.
      */
-    public function test_failed_destination_preserves_the_source_and_honors_retry_after(): void
+    public function test_failed_destination_preserves_cached_responses_and_honors_retry_after(): void
     {
-        // Fail only after following the redirect, with a delay longer than the configured minimum.
-        Http::fakeSequence()->push('initial')->push('', 302, ['Location' => '/catalog'])->push('unavailable', 503, ['Retry-After' => '30']);
+        // Return a no-store error from the destination with a retry-after longer than the default cooldown.
+        Http::fake([
+            self::API_URL => Http::sequence()->push('initial')->push('', 302, ['Location' => '/catalog']),
+            self::DESTINATION_URL => Http::sequence()->push('cached-destination')
+                ->push('unavailable', 503, ['Retry-After' => '30', 'Cache-Control' => 'no-store']),
+        ]);
 
-        // Capture the source before the redirect chain encounters the unavailable destination.
+        // Cache both URLs independently and retain the original source payload for comparison.
         Http::remember([10, 60])->get(self::API_URL);
         $key = array_key_first(Cache::store()->getStore()->all());
         $original = Cache::get($key);
+        Http::remember([10, 60])->get(self::DESTINATION_URL);
 
         // Start the destination's requested cooldown from the failed deferred attempt.
         Carbon::setTestNow(Carbon::now()->addSeconds(10));
@@ -370,8 +378,40 @@ final class RefreshRedirectTest extends TestCase
         Carbon::setTestNow(Carbon::now()->addSeconds(20));
         self::assertSame($original, Cache::get($key));
         self::assertSame('initial', Http::remember([10, 60])->get(self::API_URL)->body());
+
+        // Check the destination's stale entry with a cache-only request that leaves the queue empty.
+        self::assertSame('cached-destination', Http::withHeaders(['Cache-Control' => 'only-if-cached'])->remember([10, 60])->get(self::DESTINATION_URL)->body());
         self::assertCount(0, app(DeferredCallbackCollection::class));
-        Http::assertSentCount(3);
+        Http::assertSentCount(4);
+    }
+
+    /**
+     * Confirm a successful destination can withdraw cache eligibility for both entries.
+     */
+    public function test_restrictive_successful_destination_removes_both_entries(): void
+    {
+        // Make the destination return a successful response that prohibits further caching.
+        Http::fake([
+            self::API_URL => Http::sequence()->push('initial')->push('', 302, ['Location' => '/catalog']),
+            self::DESTINATION_URL => Http::sequence()->push('cached-destination')
+                ->push('restricted', 200, ['Cache-Control' => 'no-store']),
+        ]);
+
+        // Populate both cache entries before the source starts redirecting.
+        $pending = Http::remember([10, 60]);
+        $pending->get(self::API_URL);
+        $pending->get(self::DESTINATION_URL);
+
+        // Serve the stale source first, then follow its redirect during the deferred refresh.
+        Carbon::setTestNow(Carbon::now()->addSeconds(10));
+        self::assertSame('initial', $pending->get(self::API_URL)->body());
+        app(DeferredCallbackCollection::class)->invoke();
+
+        // Use cache-only requests to verify eviction for both URLs.
+        $cacheOnly = Http::withHeaders(['Cache-Control' => 'only-if-cached'])->remember([10, 60]);
+        self::assertSame(504, $cacheOnly->get(self::API_URL)->status());
+        self::assertSame(504, $cacheOnly->get(self::DESTINATION_URL)->status());
+        Http::assertSentCount(4);
     }
 
     /**
