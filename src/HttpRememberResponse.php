@@ -242,6 +242,111 @@ final class HttpRememberResponse
     }
 
     /**
+     * Select a conditional request header for the stored representation.
+     *
+     * @return array{string, string}|null The conditional header and its validated value.
+     */
+    public function validator(): ?array
+    {
+        // Revalidate full 200 responses whose body can be reused as a complete representation.
+        if ($this->data['status'] !== HttpStatus::HTTP_OK) {
+            return null;
+        }
+
+        // Prefer an entity tag, including a weak tag, over a date validator.
+        $headers = array_change_key_case($this->data['headers'], CASE_LOWER);
+        if (($tag = self::entityTag($headers['etag'] ?? [])) !== null) {
+            return ['If-None-Match', $tag];
+        }
+
+        // Use a modification date only when it is a single valid HTTP date.
+        $modified = $headers['last-modified'] ?? [];
+        if (count($modified) === 1 && HttpRememberCachePolicy::httpDate($modified[0]) !== null) {
+            return ['If-Modified-Since', $modified[0]];
+        }
+
+        // Leave the refresh unconditional when the origin supplied no usable validator.
+        return null;
+    }
+
+    /**
+     * Apply not-modified metadata to the confirmed stored response and reuse its body.
+     *
+     * @param  ResponseInterface  $response  The upstream 304 response.
+     * @param  string  $header  The conditional header sent for this representation.
+     * @param  string  $value  The validator sent to the origin.
+     * @return ResponseInterface|null The reconstructed response, or null if its validator conflicts.
+     */
+    public function revalidate(ResponseInterface $response, string $header, string $value): ?ResponseInterface
+    {
+        // Compare opaque tags because If-None-Match allows weak matches.
+        if ($header === 'If-None-Match' && $response->hasHeader('ETag')) {
+            $tag = self::entityTag($response->getHeader('ETag'));
+            if ($tag === null || ltrim($tag, 'W/') !== ltrim($value, 'W/')) {
+                return null;
+            }
+
+            // Retain a weak tag when the cached body is only known to match weakly.
+            if (str_starts_with($value, 'W/')) {
+                $response = $response->withHeader('ETag', $value);
+            }
+        }
+
+        // Check any returned modification timestamp against the date sent to the origin.
+        if ($header === 'If-Modified-Since') {
+            if ($response->hasHeader('Last-Modified')) {
+                $modified = HttpRememberCachePolicy::httpDate($response->getHeaderLine('Last-Modified'));
+                $since = HttpRememberCachePolicy::httpDate($value);
+                if ($modified === null || $since === null || $modified > $since) {
+                    return null;
+                }
+            }
+
+            // Keep the existing validator when a date confirmation cannot establish byte identity.
+            $response = $response->withoutHeader('ETag');
+        }
+
+        // Measure HTTP age from the validation response instead of carrying over the old age.
+        $updated = $this->toResponse()->withoutHeader('Age')->withoutHeader('Date');
+
+        // Treat even incorrectly nominated cache policy fields as origin restrictions.
+        $connectionFields = array_map('trim', explode(',', strtolower($response->getHeaderLine('Connection'))));
+        $policyFields = ['age', 'cache-control', 'content-range', 'date', 'expires', 'set-cookie', 'set-cookie2', 'vary'];
+
+        // Preserve the stored body's framing and omit metadata scoped to this connection.
+        $excluded = [
+            'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection',
+            'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length', 'content-encoding',
+            ...array_diff($connectionFields, $policyFields),
+        ];
+        foreach ($response->getHeaders() as $name => $values) {
+            if (! in_array(strtolower($name), $excluded, true)) {
+                $updated = $updated->withHeader($name, $values);
+            }
+        }
+
+        // Let the shared storage path evaluate the merged policy and guarded write.
+        return $updated;
+    }
+
+    /**
+     * Read a single valid entity tag for a conditional request or a validation reply.
+     *
+     * @param  list<string>  $values  The header field values supplied by the origin.
+     * @return string|null The entity tag, or null when the values are ambiguous or malformed.
+     */
+    private static function entityTag(array $values): ?string
+    {
+        // Reject multiple field values, wildcard conditions, and malformed tags.
+        if (count($values) !== 1) {
+            return null;
+        }
+        $tag = trim($values[0], " \t");
+
+        return preg_match('~^(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"$~D', $tag) === 1 ? $tag : null;
+    }
+
+    /**
      * Build a new response with an independent body stream for each cache hit.
      *
      * @param  bool  $withAge  Whether to expose the current HTTP age on a cache hit.

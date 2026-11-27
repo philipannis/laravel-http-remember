@@ -21,7 +21,7 @@ final readonly class HttpRememberCachePolicy
      *
      * @var list<string>
      */
-    public const CONTROL_HEADERS = ['cache-control', 'pragma'];
+    public const CONTROL_HEADERS = ['cache-control', 'pragma', 'if-none-match', 'if-modified-since'];
 
     /**
      * Retain response-specific deadlines and the origin's age at receipt.
@@ -326,10 +326,10 @@ final readonly class HttpRememberCachePolicy
     /**
      * Parse HTTP dates without accepting relative expressions or silently repaired dates.
      *
-     * @param  string  $value  The Date or Expires field value.
+     * @param  string  $value  The HTTP date field value.
      * @return float|null The UTC Unix timestamp, or null for an invalid date.
      */
-    private static function httpDate(string $value): ?float
+    public static function httpDate(string $value): ?float
     {
         // Accept the preferred format and the two historical HTTP date formats.
         foreach ([DATE_RFC7231, 'l, d-M-y H:i:s \\G\\M\\T', 'D M j H:i:s Y'] as $format) {
@@ -339,7 +339,7 @@ final readonly class HttpRememberCachePolicy
             }
         }
 
-        // Invalid expiration dates are treated as already expired by the caller.
+        // Let the caller decide how an invalid date affects eligibility.
         return null;
     }
 

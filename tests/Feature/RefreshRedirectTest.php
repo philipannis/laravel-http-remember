@@ -217,7 +217,8 @@ final class RefreshRedirectTest extends TestCase
         $destination = 'https://accounts.example.test/profile';
         $jar = CookieJar::fromArray(['session' => 'alice'], 'accounts.example.test');
         Http::fake([
-            self::API_URL => Http::sequence()->push('initial')->push('', 302, ['Location' => $destination])->push('', 302, ['Location' => $destination]),
+            self::API_URL => Http::sequence()->push('initial', 200, ['ETag' => '"source"'])
+                ->push('', 302, ['Location' => $destination])->push('', 302, ['Location' => $destination]),
             $destination =>
                 /**
                  * Require cross-origin authorization stripping and return the selected session.
@@ -243,6 +244,11 @@ final class RefreshRedirectTest extends TestCase
         Carbon::setTestNow(Carbon::now()->addSeconds(10));
         $pending->get(self::API_URL);
         app(DeferredCallbackCollection::class)->invoke();
+
+        // Send the source's validator only to the source, before redirecting.
+        Http::assertSentCount(3);
+        self::assertSame(['"source"'], Http::recorded()[1][0]->header('If-None-Match'));
+        self::assertSame([], Http::recorded()[2][0]->header('If-None-Match'));
 
         // Keep deferred cookie changes out of the caller's jar and fetch session-issuing destinations live.
         self::assertSame('alice', $jar->getCookieByName('session')->getValue());
