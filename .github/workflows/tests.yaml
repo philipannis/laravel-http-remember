@@ -1,9 +1,11 @@
 name: Tests
 
+# Check pushes and pull requests through the same test matrix.
 on:
   push:
   pull_request:
 
+# Give the jobs read access to check out the repository.
 permissions:
   contents: read
 
@@ -11,25 +13,34 @@ jobs:
   test:
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
+
+    # Let each supported combination report its own result.
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Exercise the minimum PHP version supported by Laravel 12.
           - php: '8.2'
             laravel: '12'
             testbench: '10'
+
+          # Cover the first PHP version shared by both Laravel majors.
           - php: '8.3'
             laravel: '12'
             testbench: '10'
           - php: '8.3'
             laravel: '13'
             testbench: '11'
+
+          # Verify both Laravel majors on PHP 8.4.
           - php: '8.4'
             laravel: '12'
             testbench: '10'
           - php: '8.4'
             laravel: '13'
             testbench: '11'
+
+          # Check both Laravel majors on the newest PHP version in the matrix.
           - php: '8.5'
             laravel: '12'
             testbench: '10'
@@ -50,9 +61,11 @@ jobs:
           --health-retries 10
 
     steps:
+      # Check out the revision associated with this workflow run.
       - name: Check out code
         uses: actions/checkout@v6
 
+      # Install the matrix's PHP version and enable the PhpRedis extension for the worker tests.
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
@@ -63,17 +76,20 @@ jobs:
         env:
           update: true
 
-      - name: Validate Composer configuration
+      # Catch invalid package metadata before resolving dependencies.
+      - name: Validate composer configuration
         run: composer validate --strict
 
-      - name: Install dependencies for this Laravel version
+      # Resolve dependencies for the selected Laravel and Testbench majors.
+      - name: Install dependencies for this laravel version
         run: >
           composer update
           --with "laravel/framework:^${{ matrix.laravel }}.0"
           --with "orchestra/testbench:^${{ matrix.testbench }}.0"
           --prefer-dist --no-interaction --no-progress
 
-      - name: Verify Laravel version
+      # Confirm the installed framework matches the matrix job's Laravel major.
+      - name: Verify laravel version
         env:
           EXPECTED_LARAVEL_MAJOR: ${{ matrix.laravel }}
         run: |
@@ -88,17 +104,24 @@ jobs:
             echo "Laravel $actual\n";
           '
 
+      # Verify the installed packages support this job's PHP runtime and extensions.
       - name: Check platform requirements
         run: composer check-platform-reqs
 
+      # Audit the locked dependencies selected for this PHP and Laravel version.
+      - name: Audit composer dependencies
+        run: composer audit --locked
+
+      # Run the default feature and unit suites for this combination.
       - name: Run tests
         run: composer run test
 
       # Run the two-worker checks using this job's runner-assigned Redis port.
-      - name: Test Redis worker coordination
+      - name: Test redis worker coordination
         env:
           HTTP_REMEMBER_CI_REDIS_PORT: ${{ job.services.redis.ports[6379] }}
         run: vendor/bin/phpunit tests/Integration/RedisConcurrencyTest.php
 
+      # Check source and test formatting with Laravel Pint.
       - name: Check formatting
         run: composer run format:check
