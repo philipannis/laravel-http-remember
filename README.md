@@ -131,7 +131,7 @@ Positive `max-age` and `min-fresh` requirements are checked against existing ent
 
 `only-if-cached` returns an eligible cached response or HTTP 504. It never starts a foreground request or a deferred refresh, including when the cache is unavailable or another option would normally bypass caching.
 
-Conditional request headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, or `If-Range`) and `Range` bypass caching. The normal HTTP client and origin handle their semantics.
+Caller-supplied conditional request headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, or `If-Range`) and `Range` bypass caching. The normal HTTP client and origin handle their semantics.
 
 ## Per-request options
 
@@ -401,7 +401,7 @@ The transport options included in the key are `auth`, `cert`, `ssl_key`, `verify
 
 Header names and their ordering are normalized. Included header values, body bytes, and query ordering stay as sent. Equivalent query strings or JSON bodies with different ordering can therefore create distinct entries. The default exclusions preserve separate entries for different bearer tokens, basic credentials, `Cookie` headers, bodies, or lifetimes. URLs and credentials aren't written into keys as plaintext.
 
-Only exclude headers that do not affect the response data. Authentication, tenant, language, API-version, and idempotency headers remain in the key by default. Responses with `Vary: *` or a `Vary` field naming an ignored header, `Cache-Control`, or `Pragma` are returned live without being cached or reused, because their variants cannot be distinguished by the filtered key. Other `Vary` headers remain cacheable because their request headers are still included.
+Only exclude headers that do not affect the response data. Authentication, tenant, language, API-version, and idempotency headers remain in the key by default. Responses with `Vary: *` or a `Vary` field naming an ignored header, `Cache-Control`, `Pragma`, `If-None-Match`, or `If-Modified-Since` are returned live without being cached or reused, because their variants cannot be distinguished by the filtered key. Other `Vary` headers remain cacheable because their request headers are still included.
 
 ### Group generations and invalidation
 
@@ -417,7 +417,7 @@ The cache stores arrays and scalars for the response's status, headers, body, pr
 
 Malformed cache payloads are treated as misses. Response headers and bodies are stored as ordinary cache data, even though the keys are hashed.
 
-The `remember()` policy sets the maximum lifetime. The [HTTP cache rules](#http-cache-rules) can shorten it or prohibit storage. Cache hits update the `Age` header to include both the response's upstream age and its time in this cache. `ETag` and `Last-Modified` are retained, but the package does not generate conditional validation requests.
+The `remember()` policy sets the maximum lifetime. The [HTTP cache rules](#http-cache-rules) can shorten it or prohibit storage. Cache hits update the `Age` header to include both the response's upstream age and its time in this cache.
 
 Responses containing `Set-Cookie` or `Set-Cookie2` are returned live and never stored. Existing request cookies remain part of the cache key, so established sessions can reuse their own eligible responses. Use ordinary live requests for authentication and session creation, including APIs that return session credentials only in the body.
 
@@ -536,6 +536,8 @@ Keep `InvokeDeferredCallbacks` and the normal termination hooks enabled. Long-ru
 
 Refreshes replay the prepared request from the stale hit with an independent copy of its complete body. They reuse its URL, headers, credentials, and selected cache store. Credentials are not fetched again from application configuration. Foreground `delay` options are removed from the refresh.
 
+A deferred GET refresh of a stored `200` sends `If-None-Match` for a valid `ETag`, or `If-Modified-Since` for a valid `Last-Modified`. A matching `304 Not Modified` reuses the stored status and body, applies the updated response metadata, and recalculates freshness under the usual origin and `remember()` limits. The validator is scoped to the original refresh request. A `304` that cannot confirm the stored representation follows the refresh failure path.
+
 Deferred refreshes follow your request's `allow_redirects` settings. This includes the redirect limit, allowed protocols, method handling, and callbacks. Each refresh starts counting redirects from zero, and all requests in the chain share one timeout budget. Guzzle applies its usual rules for cookies and credentials when following redirects. Refreshes use a separate copy of your cookie jar, so they don't change your cookies.
 
 The refresh applies HTTP cache restrictions to the final successful response. If the destination's response can be cached, it gets its own cache entry based on its URL, headers, and credentials. The old source response is then removed unless another request has replaced or invalidated it. Later calls to the source still follow its live redirect, but can reuse the cached destination response. If the redirect fails or an application predicate rejects the destination, the old source keeps its original expiry. A successful destination response that prohibits caching or issues cookies retires the old source too, so later callers obtain their own live response. Invalidation during the refresh prevents it from storing a response.
@@ -549,7 +551,7 @@ The refresh applies HTTP cache restrictions to the final successful response. If
 | The response predicate throws or returns a non-boolean value | Skip caching and log the predicate failure. |
 | A live request throws or times out | Keep the usual exception or rejected promise. |
 | A deferred refresh fails | Keep the old entry until its effective expiry and log the failure. |
-| A refresh ends in a 2xx response with an HTTP cache restriction, a session cookie, or an unusable `Vary` field | Remove the observed old entry without removing a concurrent replacement. |
+| A refresh returns a 2xx or matching 304 with an HTTP cache restriction, a session cookie, or an unusable `Vary` field | Remove the observed old entry without removing a concurrent replacement. |
 | An `only-if-cached` request has no usable entry | Return HTTP 504 without a foreground or deferred transfer. |
 | A cache read or write fails | Let the live request proceed and log the cache failure. |
 
@@ -557,7 +559,7 @@ Refreshes make one attempt and follow any redirects allowed by your request sett
 
 ### Refresh cooldowns
 
-A deferred refresh that returns a non-2xx response or throws a transport exception starts a fixed cooldown. The default is 15 seconds, configured by `refresh_cooldown_seconds`. Stale callers keep receiving the existing response, but they do not schedule another refresh until the cooldown ends. A later stale request triggers the next attempt without sleeps or automatic retries.
+A deferred refresh starts a fixed cooldown after an unsuccessful HTTP response or a transport exception. An unconfirmed `304` counts as an unsuccessful response. The default is 15 seconds, configured by `refresh_cooldown_seconds`. Stale callers keep receiving the existing response, but they do not schedule another refresh until the cooldown ends. A later stale request triggers the next attempt without sleeps or automatic retries.
 
 For failed HTTP responses, `Retry-After` can extend the cooldown beyond the configured minimum. Both non-negative integer seconds and HTTP dates are supported. Missing, malformed, negative, or past values use the configured minimum. Predicate rejections, oversized responses, lock contention, and invalidation do not start cooldowns.
 
