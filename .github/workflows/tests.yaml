@@ -30,7 +30,6 @@ jobs:
           - php: '8.4'
             laravel: '13'
             testbench: '11'
-            redis: true
           - php: '8.5'
             laravel: '12'
             testbench: '10'
@@ -38,10 +37,10 @@ jobs:
             laravel: '13'
             testbench: '11'
 
-    # Give one existing matrix job a disposable Redis service on the GitHub runner.
+    # Give each PHP and Laravel job its own disposable Redis service.
     services:
       redis:
-        image: ${{ matrix.redis && 'redis:7-alpine' || '' }}
+        image: redis:7-alpine
         ports:
           - 6379/tcp
         options: >-
@@ -58,7 +57,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: ${{ matrix.redis && 'redis' || '' }}
+          extensions: redis
           coverage: none
           tools: composer:v2
         env:
@@ -95,9 +94,8 @@ jobs:
       - name: Run tests
         run: composer run test
 
-      # Run the coordination checks using the service's runner-assigned port.
+      # Run the two-worker checks using this job's runner-assigned Redis port.
       - name: Test Redis worker coordination
-        if: matrix.redis
         env:
           HTTP_REMEMBER_CI_REDIS_PORT: ${{ job.services.redis.ports[6379] }}
         run: vendor/bin/phpunit tests/Integration/RedisConcurrencyTest.php
