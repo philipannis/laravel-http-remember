@@ -538,7 +538,7 @@ Refreshes replay the prepared request from the stale hit with an independent cop
 
 Deferred refreshes follow your request's `allow_redirects` settings. This includes the redirect limit, allowed protocols, method handling, and callbacks. Each refresh starts counting redirects from zero, and all requests in the chain share one timeout budget. Guzzle applies its usual rules for cookies and credentials when following redirects. Refreshes use a separate copy of your cookie jar, so they don't change your cookies.
 
-If the destination's response can be cached, it gets its own cache entry based on its URL, headers, and credentials. The old source response is then removed unless another request has replaced or invalidated it. Later calls to the source still follow its live redirect, but can reuse the cached destination response. If the redirect fails or an application predicate rejects the destination, the old source keeps its original expiry. A destination that prohibits caching or issues cookies retires the old source too, so later callers obtain their own live response. Invalidation during the refresh prevents it from storing a response.
+The refresh applies HTTP cache restrictions to the final successful response. If the destination's response can be cached, it gets its own cache entry based on its URL, headers, and credentials. The old source response is then removed unless another request has replaced or invalidated it. Later calls to the source still follow its live redirect, but can reuse the cached destination response. If the redirect fails or an application predicate rejects the destination, the old source keeps its original expiry. A successful destination response that prohibits caching or issues cookies retires the old source too, so later callers obtain their own live response. Invalidation during the refresh prevents it from storing a response.
 
 ### Failure behavior
 
@@ -549,7 +549,7 @@ If the destination's response can be cached, it gets its own cache entry based o
 | The response predicate throws or returns a non-boolean value | Skip caching and log the predicate failure. |
 | A live request throws or times out | Keep the usual exception or rejected promise. |
 | A deferred refresh fails | Keep the old entry until its effective expiry and log the failure. |
-| A refresh introduces an HTTP cache restriction, a session cookie, or an unusable `Vary` field | Remove the observed old entry without removing a concurrent replacement. |
+| A refresh ends in a 2xx response with an HTTP cache restriction, a session cookie, or an unusable `Vary` field | Remove the observed old entry without removing a concurrent replacement. |
 | An `only-if-cached` request has no usable entry | Return HTTP 504 without a foreground or deferred transfer. |
 | A cache read or write fails | Let the live request proceed and log the cache failure. |
 

@@ -111,12 +111,18 @@ final class RefreshCooldownTest extends TestCase
      * @param  string|null  $header  The upstream retry-after value, if present.
      * @param  int  $status  The unsuccessful refresh status.
      * @param  int  $delay  Seconds to wait after receiving that response.
+     * @param  array<string, string>  $headers  Other headers on the unsuccessful response.
      */
     #[DataProvider('retryAfterValues')]
-    public function test_retry_after_controls_the_next_attempt(?string $header, int $status, int $delay): void
+    public function test_retry_after_controls_the_next_attempt(?string $header, int $status, int $delay, array $headers = []): void
     {
+        // Omit retry-after entirely when checking the fallback for a missing header.
+        if ($header !== null) {
+            $headers['Retry-After'] = $header;
+        }
+
         // Give the server's requested delay room to elapse before hard expiry.
-        Http::fakeSequence()->push('initial')->push('unavailable', $status, $header === null ? [] : ['Retry-After' => $header])->push('updated');
+        Http::fakeSequence()->push('initial')->push('unavailable', $status, $headers)->push('updated');
         Http::remember([10, 300])->get(self::API_URL);
         $this->at(10);
         Http::remember([10, 300])->get(self::API_URL);
@@ -140,12 +146,17 @@ final class RefreshCooldownTest extends TestCase
     /**
      * Provide delay seconds, HTTP dates, and values that must fall back to fifteen seconds.
      *
-     * @return iterable<string, array{string|null, int, int}> Headers keyed by interpretation.
+     * @return iterable<string, array{string|null, int, int, 3?: array<string, string>}> Headers keyed by interpretation.
      */
     public static function retryAfterValues(): iterable
     {
         yield 'seconds on rate limit' => ['120', 429, 120];
         yield 'seconds on service failure' => ['60', 503, 60];
+
+        // Keep stale data available during cooldown when the error response restricts caching.
+        yield 'no-store on service failure' => ['60', 503, 60, ['Cache-Control' => 'no-store']];
+        yield 'vary on rate limit' => ['120', 429, 120, ['Vary' => '*']];
+
         yield 'HTTP date' => ['Thu, 01 Jan 2026 12:01:30 GMT', 503, 80];
         yield 'obsolete RFC 850 date' => ['Thursday, 01-Jan-26 12:01:30 GMT', 503, 80];
         yield 'obsolete asctime date' => ['Thu Jan  1 12:01:30 2026', 503, 80];
@@ -210,8 +221,12 @@ final class RefreshCooldownTest extends TestCase
      */
     public function test_cooldowns_never_extend_the_response_lifetime(): void
     {
-        // Retain the original cache entry while a huge server delay is clipped to hard expiry.
-        Http::fakeSequence()->push('initial')->push('unavailable', 503, ['Retry-After' => str_repeat('9', 400)])->push('foreground failure', 503)->push('updated');
+        // Return a no-store error with a retry-after value that exceeds the original lifetime.
+        Http::fakeSequence()->push('initial')
+            ->push('unavailable', 503, ['Retry-After' => str_repeat('9', 400), 'Cache-Control' => 'no-store'])
+            ->push('foreground failure', 503)->push('updated');
+
+        // Capture the original cache entry and its expiry before attempting the refresh.
         Http::remember([10, 60])->get(self::API_URL);
         $key = array_key_first(Cache::store()->getStore()->all());
         $original = Cache::store()->getStore()->all()[$key];

@@ -653,9 +653,9 @@ final class HttpRememberMiddleware
      * @param  EventLogger  $eventLog  The event log publisher bound to this transfer's store.
      * @param  HttpRememberResponse|null  $generation  The response to replace, or null for a cache miss.
      * @param  HttpRememberGroup|null  $group  The group generation observed before the transfer.
-     * @param  Closure(): bool|null  $canRemember  An additional generation guard for redirected refreshes.
+     * @param  Closure(): bool|null  $refreshSourceIsCurrent  The deferred refresh's source generation guard, or null for a foreground transfer.
      * @param  string|null  $outcome  The final storage decision, when requested.
-     * @param  HttpRememberResponse|null  $observed  The entry seen before a foreground transfer, if any.
+     * @param  HttpRememberResponse|null  $observed  The entry seen at this key before the transfer, if any.
      * @return PromiseInterface The original response with cache persistence attached.
      */
     private function sendAndRemember(
@@ -667,7 +667,7 @@ final class HttpRememberMiddleware
         Closure $eventLog,
         ?HttpRememberResponse $generation = null,
         ?HttpRememberGroup $group = null,
-        ?Closure $canRemember = null,
+        ?Closure $refreshSourceIsCurrent = null,
         ?string &$outcome = null,
         ?HttpRememberResponse $observed = null,
     ): PromiseInterface {
@@ -688,12 +688,21 @@ final class HttpRememberMiddleware
              * @param  ResponseInterface  $response  The live upstream response.
              * @return ResponseInterface The unchanged upstream response.
              */
-            function (ResponseInterface $response) use ($request, $cache, $key, $generation, $group, $eventLog, $canRemember, $started, $observed, &$outcome): ResponseInterface {
+            function (ResponseInterface $response) use ($request, $cache, $key, $generation, $group, $eventLog, $refreshSourceIsCurrent, $started, $observed, &$outcome): ResponseInterface {
                 // Keep every persistence outcome observable after the write lock is released.
                 $outcome = 'write_lock_unavailable';
 
                 // Keep response capture and cache persistence optional for the caller.
                 try {
+                    // Preserve cached generations through redirect hops and unsuccessful refreshes.
+                    if ($refreshSourceIsCurrent !== null
+                        && ($response->getStatusCode() < HttpStatus::HTTP_OK || $response->getStatusCode() >= HttpStatus::HTTP_MULTIPLE_CHOICES)) {
+                        // Report the skipped write and return the response for redirect or cooldown handling.
+                        $this->recordStorageOutcome($eventLog, $key, $outcome = 'response_status', $response, $generation);
+
+                        return $response;
+                    }
+
                     // Honor origin restrictions before buffering, filtering, or persisting response data.
                     $policy = HttpRememberCachePolicy::forResponse($response, $this->settings, (hrtime(true) - $started) / 1_000_000_000);
                     if ($policy->reason !== null) {
@@ -729,7 +738,7 @@ final class HttpRememberMiddleware
                          *
                          * @return void
                          */
-                        function () use ($request, $cache, $key, $generation, $cached, $group, $eventLog, $canRemember, $observed, &$outcome): void {
+                        function () use ($request, $cache, $key, $generation, $cached, $group, $eventLog, $refreshSourceIsCurrent, $observed, &$outcome): void {
                             // Cancel writes started before a successful mutation or metadata removal.
                             if ($group !== null && ! $group->isCurrent()) {
                                 $outcome = 'group_invalidated';
@@ -738,7 +747,7 @@ final class HttpRememberMiddleware
                             }
 
                             // Keep redirected destinations tied to the source response being refreshed.
-                            if ($canRemember !== null && ! $canRemember()) {
+                            if ($refreshSourceIsCurrent !== null && ! $refreshSourceIsCurrent()) {
                                 $outcome = 'generation_changed';
 
                                 // Leave the destination untouched when its source is no longer current.
@@ -1043,7 +1052,7 @@ final class HttpRememberMiddleware
         $outcome = null;
 
         // Reuse the source generation check before destination writes and source removal.
-        $canRemember =
+        $refreshSourceIsCurrent =
             /**
              * Cancel destination writes when the source response was removed or replaced.
              *
@@ -1060,7 +1069,7 @@ final class HttpRememberMiddleware
              * @param  array<string, mixed>  $nextOptions  The caller's options for this hop.
              * @return PromiseInterface The unchanged upstream response with optional persistence.
              */
-            function (RequestInterface $nextRequest, array $nextOptions) use ($handler, $cache, $key, $generation, $group, $canCache, $canRemember, $eventLog, $storeName, $deadline, &$first, &$destinationKey, &$outcome): PromiseInterface {
+            function (RequestInterface $nextRequest, array $nextOptions) use ($handler, $cache, $key, $generation, $group, $canCache, $refreshSourceIsCurrent, $eventLog, $storeName, $deadline, &$first, &$destinationKey, &$outcome): PromiseInterface {
                 // Preserve the first hop's exact timeout and spend only its remainder on redirects.
                 if (! $first) {
                     // Include time spent in earlier transfers and redirect callbacks.
@@ -1105,7 +1114,7 @@ final class HttpRememberMiddleware
                     $destinationKey === $key ? $eventLog : $this->eventLogger($nextRequest, $storeName),
                     $destinationKey === $key ? $generation : null,
                     $group,
-                    $canRemember,
+                    $refreshSourceIsCurrent,
                     $outcome,
                     HttpRememberResponse::restore($cache->get($destinationKey)),
                 );
@@ -1133,9 +1142,9 @@ final class HttpRememberMiddleware
                      *
                      * @return bool Whether the original source entry was removed.
                      */
-                    static function () use ($cache, $key, $group, $canRemember): bool {
+                    static function () use ($cache, $key, $group, $refreshSourceIsCurrent): bool {
                         // Leave newer responses and invalidated groups untouched.
-                        if (($group !== null && ! $group->isCurrent()) || ! $canRemember()) {
+                        if (($group !== null && ! $group->isCurrent()) || ! $refreshSourceIsCurrent()) {
                             return false;
                         }
 
